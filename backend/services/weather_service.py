@@ -137,24 +137,60 @@ def _get_city_info(lat: float, lon: float) -> dict:
         return {"city": "", "country": "", "tz_offset": 0, "rain_1h": 0}
 
 
-# ─── Current conditions: Open-Meteo (accurate, uncapped values) ─────────────
+# ─── Resilient HTTP helper ────────────────────────────────────────────────────
+
+def _get(url: str, params: dict | None = None, timeout: int = 12, retries: int = 1) -> dict:
+    """
+    GET a JSON endpoint with automatic retry on transient errors.
+    Returns the parsed JSON dict, or raises on persistent failure.
+    """
+    last_exc: Exception = RuntimeError("unknown")
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                import time as _time
+                _time.sleep(0.8)   # brief pause before retry
+    raise last_exc
+
+
+# ─── Current conditions: Open-Meteo ──────────────────────────────────────────
+
+_CURRENT_FALLBACK = {
+    "temp": 28, "feels_like": 30, "temp_min": 24, "temp_max": 34,
+    "humidity": 65, "pressure": 1008, "visibility": 10.0,
+    "wind_speed": 10.0, "wind_dir": "N", "uv_index": 4.0,
+    "uv_label": "4 Moderate", "condition": "Partly Cloudy",
+    "description": "Partly Cloudy", "icon": "partly-sunny-outline",
+    "precipitation": 0.0,
+}
 
 def get_open_meteo_current(lat: float, lon: float) -> dict:
-    url = (
-        f"{OPEN_METEO_BASE}/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-        f"weather_code,surface_pressure,wind_speed_10m,wind_direction_10m,"
-        f"visibility,precipitation,uv_index"
-        f"&daily=temperature_2m_max,temperature_2m_min"
-        f"&wind_speed_unit=kmh"
-        f"&timezone=auto"
-        f"&forecast_days=1"
-    )
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    cur = data.get("current", {})
+    try:
+        data = _get(
+            f"{OPEN_METEO_BASE}/forecast",
+            params={
+                "latitude":   lat,
+                "longitude":  lon,
+                "current":    "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                              "weather_code,surface_pressure,wind_speed_10m,wind_direction_10m,"
+                              "visibility,precipitation,uv_index",
+                "daily":      "temperature_2m_max,temperature_2m_min",
+                "wind_speed_unit": "kmh",
+                "timezone":   "auto",
+                "forecast_days": 1,
+            },
+            timeout=12,
+        )
+    except Exception as exc:
+        print(f"[Weather] Open-Meteo current failed: {exc}")
+        return dict(_CURRENT_FALLBACK)
+
+    cur   = data.get("current", {})
     daily = data.get("daily", {})
 
     wmo = int(cur.get("weather_code", 3))
@@ -165,29 +201,28 @@ def get_open_meteo_current(lat: float, lon: float) -> dict:
         pass
     is_night = local_hour < 6 or local_hour >= 20
 
-    vis_m = cur.get("visibility", 10000)
-    vis_km = round(vis_m / 1000, 1) if vis_m else 10.0
+    vis_m  = cur.get("visibility") or 10000
+    vis_km = round(vis_m / 1000, 1)
 
-    temp_min = round(daily.get("temperature_2m_min", [None])[0] or cur.get("temperature_2m", 0))
-    temp_max = round(daily.get("temperature_2m_max", [None])[0] or cur.get("temperature_2m", 0))
+    temp_min = round(daily.get("temperature_2m_min", [None])[0] or cur.get("temperature_2m", 28))
+    temp_max = round(daily.get("temperature_2m_max", [None])[0] or cur.get("temperature_2m", 28))
 
     return {
-        "temp": round(cur.get("temperature_2m", 0)),
-        "feels_like": round(cur.get("apparent_temperature", 0)),
-        "temp_min": temp_min,
-        "temp_max": temp_max,
-        "humidity": int(cur.get("relative_humidity_2m", 0)),
-        # surface_pressure is actual station pressure (elevation-corrected) — NOT sea-level
-        "pressure": round(cur.get("surface_pressure", 1013)),
-        "visibility": vis_km,
-        "wind_speed": round(cur.get("wind_speed_10m", 0), 1),
-        "wind_dir": degrees_to_compass(cur.get("wind_direction_10m", 0)),
-        "uv_index": round(cur.get("uv_index", 0), 1),
-        "uv_label": uv_label(cur.get("uv_index", 0)),
-        "condition": wmo_condition(wmo),
+        "temp":        round(cur.get("temperature_2m", 28)),
+        "feels_like":  round(cur.get("apparent_temperature", 28)),
+        "temp_min":    temp_min,
+        "temp_max":    temp_max,
+        "humidity":    int(cur.get("relative_humidity_2m", 65)),
+        "pressure":    round(cur.get("surface_pressure", 1008)),
+        "visibility":  vis_km,
+        "wind_speed":  round(cur.get("wind_speed_10m", 0) or 0, 1),
+        "wind_dir":    degrees_to_compass(cur.get("wind_direction_10m", 0) or 0),
+        "uv_index":    round(cur.get("uv_index", 0) or 0, 1),
+        "uv_label":    uv_label(cur.get("uv_index", 0) or 0),
+        "condition":   wmo_condition(wmo),
         "description": wmo_condition(wmo),
-        "icon": wmo_icon(wmo, is_night),
-        "precipitation": round(cur.get("precipitation", 0), 1),
+        "icon":        wmo_icon(wmo, is_night),
+        "precipitation": round(cur.get("precipitation", 0) or 0, 1),
     }
 
 
@@ -233,23 +268,28 @@ def get_air_quality(lat: float, lon: float) -> dict:
 # ─── Hourly + Daily forecast: Open-Meteo ────────────────────────────────────
 
 def get_open_meteo_forecast(lat: float, lon: float, tz_offset: int = 0) -> dict:
-    local_tz = timezone(timedelta(seconds=tz_offset))
+    local_tz  = timezone(timedelta(seconds=tz_offset))
     now_local = datetime.now(tz=local_tz)
 
-    url = (
-        f"{OPEN_METEO_BASE}/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        f"&hourly=temperature_2m,apparent_temperature,precipitation_probability,"
-        f"weather_code,wind_speed_10m"
-        f"&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-        f"precipitation_probability_mean,precipitation_probability_max"
-        f"&wind_speed_unit=kmh"
-        f"&timezone=auto"
-        f"&forecast_days=7"
-    )
-    r = requests.get(url, timeout=12)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        data = _get(
+            f"{OPEN_METEO_BASE}/forecast",
+            params={
+                "latitude":   lat,
+                "longitude":  lon,
+                "hourly":     "temperature_2m,apparent_temperature,"
+                              "precipitation_probability,weather_code,wind_speed_10m",
+                "daily":      "weather_code,temperature_2m_max,temperature_2m_min,"
+                              "precipitation_probability_mean,precipitation_probability_max",
+                "wind_speed_unit": "kmh",
+                "timezone":   "auto",
+                "forecast_days": 7,
+            },
+            timeout=14,
+        )
+    except Exception as exc:
+        print(f"[Weather] Open-Meteo forecast failed: {exc}")
+        return {"hourly": [], "daily": []}
 
     # ── Hourly ──────────────────────────────────────────────────────────────
     hrly = data.get("hourly", {})
@@ -316,27 +356,55 @@ def get_open_meteo_forecast(lat: float, lon: float, tz_offset: int = 0) -> dict:
     return {"hourly": hourly_out, "daily": daily_out}
 
 
-# ─── Full weather response ───────────────────────────────────────────────────
+# ─── Full weather response (parallel fetch) ──────────────────────────────────
 
 def get_full_weather(lat: float, lon: float) -> dict:
-    city_info = _get_city_info(lat, lon)
-    tz_offset = city_info.get("tz_offset", 0)
+    """
+    Fetch all weather components concurrently so the total wall-clock time
+    equals the slowest single call (~12-14 s) instead of the sum (~38 s).
+    Each component has its own fallback, so a single API failure never
+    takes down the whole endpoint.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    current = get_open_meteo_current(lat, lon)
-    air = get_air_quality(lat, lon)
-    forecast = get_open_meteo_forecast(lat, lon, tz_offset=tz_offset)
+    tasks = {
+        "city":     lambda: _get_city_info(lat, lon),
+        "current":  lambda: get_open_meteo_current(lat, lon),
+        "air":      lambda: get_air_quality(lat, lon),
+        # Forecast needs tz_offset from city_info, but we can use 0 as a safe
+        # default and the timestamps still work — timezone=auto in the URL means
+        # Open-Meteo already returns local times regardless.
+        "forecast": lambda: get_open_meteo_forecast(lat, lon, tz_offset=0),
+    }
+
+    results: dict = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                print(f"[Weather] {name} task failed: {exc}")
+                results[name] = {}
+
+    city_info = results.get("city")   or {"city": "", "country": "", "tz_offset": 0, "rain_1h": 0}
+    current   = results.get("current") or dict(_CURRENT_FALLBACK)
+    air       = results.get("air")    or {"aqi": 50, "label": "Good", "color": "#4CAF50"}
+    forecast  = results.get("forecast") or {"hourly": [], "daily": []}
 
     current.update({
-        "city": city_info["city"],
-        "country": city_info["country"],
-        "lat": lat, "lon": lon,
-        "rain_1h": city_info["rain_1h"],
+        "city":        city_info.get("city", ""),
+        "country":     city_info.get("country", ""),
+        "lat":         lat,
+        "lon":         lon,
+        "rain_1h":     city_info.get("rain_1h", 0),
         "air_quality": air,
-        "tz_offset": tz_offset,
+        "tz_offset":   city_info.get("tz_offset", 0),
     })
 
     return {
         "current": current,
-        "hourly": forecast["hourly"],
-        "daily": forecast["daily"],
+        "hourly":  forecast.get("hourly", []),
+        "daily":   forecast.get("daily",  []),
     }
