@@ -96,27 +96,51 @@ def geocode_city(city_name: str) -> dict | None:
     Convert a city/place name to coordinates using Open-Meteo Geocoding API.
     Completely free — no API key required.
     Returns {"lat", "lon", "city", "country"} or None if not found.
+
+    Strategy: try "City, India" first (app is India-focused), fall back to
+    plain city name.  This prevents "Bandur" → Syria, "Salem" → USA, etc.
     """
-    try:
-        url = (
-            f"https://geocoding-api.open-meteo.com/v1/search"
-            f"?name={requests.utils.quote(city_name)}&count=1&language=en&format=json"
-        )
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        results = r.json().get("results", [])
-        if results:
+    def _query(name: str) -> dict | None:
+        try:
+            url = (
+                f"https://geocoding-api.open-meteo.com/v1/search"
+                f"?name={requests.utils.quote(name)}&count=3&language=en&format=json"
+            )
+            r = requests.get(url, timeout=8)
+            r.raise_for_status()
+            results = r.json().get("results", [])
+            if not results:
+                return None
+            # Prefer Indian result if available in top-3
+            for res in results:
+                if res.get("country_code", "").upper() == "IN":
+                    return {
+                        "lat":     res["latitude"],
+                        "lon":     res["longitude"],
+                        "city":    res.get("name", name),
+                        "country": res.get("country", ""),
+                        "state":   res.get("admin1", ""),
+                    }
+            # Fall back to top result
             res = results[0]
             return {
                 "lat":     res["latitude"],
                 "lon":     res["longitude"],
-                "city":    res.get("name", city_name),
+                "city":    res.get("name", name),
                 "country": res.get("country", ""),
                 "state":   res.get("admin1", ""),
             }
-    except Exception:
-        pass
-    return None
+        except Exception:
+            return None
+
+    # Try "City, India" first → then plain name
+    result = _query(f"{city_name}, India") or _query(city_name)
+    # If plain query returns a non-Indian result, try appending "India" as last resort
+    if result and result.get("country", "") not in ("India", ""):
+        india_result = _query(f"{city_name} India")
+        if india_result and india_result.get("country") == "India":
+            return india_result
+    return result
 
 
 # ─── City name from OWM (only field we need from it) ────────────────────────

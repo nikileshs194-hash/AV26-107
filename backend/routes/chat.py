@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import requests as _req
 import re
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from services.ai_service import get_ai_response
 from services.weather_service import get_full_weather, geocode_city
@@ -198,6 +199,48 @@ class ChatRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+def _fetch_flood_data(lat: float, lon: float) -> dict | None:
+    """Helper: fetch flood prediction (used in parallel thread)."""
+    try:
+        from routes.predict import _fetch_features, _model
+        import pandas as pd
+        features = _fetch_features(lat, lon)
+        prob = 0.0
+        if _model and features:
+            df   = pd.DataFrame([features])
+            prob = float(_model.predict_proba(df)[0][1])
+        risk_level = (
+            "High"     if prob >= 0.65 else
+            "Moderate" if prob >= 0.40 else
+            "Low"      if prob >= 0.20 else
+            "Very Low"
+        )
+        return {
+            "probability":   round(prob, 3),
+            "risk_level":    risk_level,
+            "flood_likely":  prob >= 0.65,
+            "rainfall_1h":   features.get("rainfall_1h",   0) if features else 0,
+            "rainfall_24h":  features.get("rainfall_24h",  0) if features else 0,
+            "soil_moisture": features.get("soil_moisture",  0) if features else 0,
+            "humidity":      features.get("humidity",       0) if features else 0,
+            "elevation":     features.get("elevation",      0) if features else 0,
+            "drainage":      features.get("drainage",       0) if features else 0,
+        }
+    except Exception as e:
+        print(f"[CHAT] Flood prediction fetch failed: {e}")
+        return None
+
+
+def _fetch_cyclone_data(lat: float, lon: float) -> dict | None:
+    """Helper: fetch cyclone prediction (used in parallel thread)."""
+    try:
+        from services.cyclone_service import predict_cyclone
+        return predict_cyclone(lat, lon)
+    except Exception as e:
+        print(f"[CHAT] Cyclone prediction fetch failed: {e}")
+        return None
+
+
 @router.post("")
 def chat(req: ChatRequest):
     try:
@@ -206,54 +249,35 @@ def chat(req: ChatRequest):
         cyclone_data      = None
         requested_weather = None
 
-        # ── City mentioned in message → fetch its weather ────────────────────
-        try:
-            requested_weather = _get_city_weather(req.message)
-        except Exception as e:
-            print(f"[CHAT] City weather extraction failed: {e}")
+        # ── Run ALL slow I/O calls in parallel ───────────────────────────────
+        # Previously sequential: city-weather + GPS-weather + flood + cyclone
+        # could stack up to 50+ seconds total and exceed the 30s mobile timeout.
+        # Running them in parallel caps total wait at ~max(individual timeout).
+        has_gps = req.lat is not None and req.lon is not None
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_get_city_weather, req.message): "city",
+            }
+            if has_gps:
+                futures[pool.submit(get_full_weather, req.lat, req.lon)]   = "weather"
+                futures[pool.submit(_fetch_flood_data, req.lat, req.lon)]  = "flood"
+                futures[pool.submit(_fetch_cyclone_data, req.lat, req.lon)]= "cyclone"
 
-        # ── GPS location weather + flood + cyclone prediction ───────────────
-        if req.lat is not None and req.lon is not None:
-            try:
-                weather_data = get_full_weather(req.lat, req.lon)
-            except Exception as e:
-                print(f"[CHAT] GPS weather fetch failed: {e}")
-
-            try:
-                from routes.predict import _fetch_features, _model
-                import pandas as pd
-
-                features = _fetch_features(req.lat, req.lon)
-                prob     = 0.0
-                if _model and features:
-                    df   = pd.DataFrame([features])
-                    prob = float(_model.predict_proba(df)[0][1])
-
-                risk_level = (
-                    "High"     if prob >= 0.65 else
-                    "Moderate" if prob >= 0.40 else
-                    "Low"      if prob >= 0.20 else
-                    "Very Low"
-                )
-                flood_data = {
-                    "probability":   round(prob, 3),
-                    "risk_level":    risk_level,
-                    "flood_likely":  prob >= 0.65,
-                    "rainfall_1h":   features.get("rainfall_1h",   0),
-                    "rainfall_24h":  features.get("rainfall_24h",  0),
-                    "soil_moisture": features.get("soil_moisture",  0),
-                    "humidity":      features.get("humidity",       0),
-                    "elevation":     features.get("elevation",      0),
-                    "drainage":      features.get("drainage",       0),
-                }
-            except Exception as e:
-                print(f"[CHAT] Flood prediction fetch failed: {e}")
-
-            try:
-                from services.cyclone_service import predict_cyclone
-                cyclone_data = predict_cyclone(req.lat, req.lon)
-            except Exception as e:
-                print(f"[CHAT] Cyclone prediction fetch failed: {e}")
+            for fut in as_completed(futures, timeout=22):
+                key = futures[fut]
+                try:
+                    val = fut.result()
+                except Exception as e:
+                    print(f"[CHAT] {key} fetch failed: {e}")
+                    val = None
+                if key == "city":
+                    requested_weather = val
+                elif key == "weather":
+                    weather_data = val
+                elif key == "flood":
+                    flood_data = val
+                elif key == "cyclone":
+                    cyclone_data = val
 
         # ── Load DB history for today if phone provided ──────────────────────
         if req.phone and not req.history:
