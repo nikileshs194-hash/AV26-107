@@ -158,6 +158,7 @@ def _build_weather_context(
     weather: dict | None,
     flood: dict | None,
     requested_weather: dict | None = None,
+    cyclone: dict | None = None,
 ) -> str:
     lines = []
 
@@ -174,7 +175,41 @@ def _build_weather_context(
     elif not requested_weather:
         lines.append("=== WEATHER === No live weather data available for this session.")
 
+    if cyclone:
+        lines += _build_cyclone_block(cyclone)
+
     return "\n".join(lines)
+
+
+def _build_cyclone_block(cyclone: dict) -> list[str]:
+    """Build cyclone context for the AI system prompt."""
+    if not cyclone:
+        return []
+    f    = cyclone.get("features", {})
+    prob = round(cyclone.get("probability", 0) * 100)
+    lines = [
+        "\n=== CYCLONE RISK (CURRENT LOCATION) ===",
+        f"Risk level        : {cyclone.get('cyclone_risk', 'Unknown')}",
+        f"Probability       : {prob}%",
+        f"IMD Category      : {cyclone.get('category', 'N/A')}",
+        f"Cyclone likely    : {'⚠ YES' if cyclone.get('cyclone_likely') else 'No'}",
+        f"Wind speed        : {f.get('wind_speed_kmh', 0)} km/h",
+        f"Wind gusts        : {f.get('wind_gusts_kmh', 0)} km/h",
+        f"Surface pressure  : {f.get('surface_pressure_hpa', 0)} hPa  "
+        f"{'← VERY LOW — cyclone eye nearby' if f.get('surface_pressure_hpa', 1013) < 980 else ''}",
+        f"Pressure drop 6h  : {f.get('pressure_drop_6h', 0)} hPa  "
+        f"{'← RAPID DEEPENING' if f.get('pressure_drop_6h', 0) >= 4 else ''}",
+        f"CAPE              : {f.get('cape_jkg', 0)} J/kg",
+        f"Coastal distance  : {f.get('coastal_proximity_km', 0)} km",
+        f"Season factor     : {'Peak season' if f.get('season_factor', 1) >= 1.2 else 'Off-season'}",
+    ]
+    if f.get("gdacs_active"):
+        lines.append(
+            f"⚠ ACTIVE CYCLONE : '{f.get('gdacs_name', 'TC')}' is "
+            f"{f.get('gdacs_distance_km', 0):.0f} km away "
+            f"(GDACS alert: {f.get('gdacs_alert_level', 'Unknown')})"
+        )
+    return lines
 
 
 _SYSTEM = """You are **JeevanSetu AI** — India's most accurate real-time weather, climate, and flood-safety assistant. You are embedded in a disaster-preparedness app.
@@ -195,8 +230,9 @@ You have LIVE data fetched RIGHT NOW from global meteorological APIs (Open-Meteo
 6. **Bold** key values: temperatures, percentages, risk levels, day names.
 7. End with a *italic safety tip* when relevant.
 8. Match the user's language (English, Kannada, Hindi).
-9. Decline questions unrelated to weather / safety / climate / floods.
-10. NEVER invent data. If a value is missing, skip it.
+9. For cyclone risk → use the CYCLONE RISK section (probability, IMD category, gusts, pressure, GDACS). "Cyclonic Storm", "Severe Cyclonic Storm" etc. are IMD categories.
+10. Decline questions unrelated to weather / safety / climate / floods / cyclones.
+11. NEVER invent data. If a value is missing, skip it.
 
 ---
 
@@ -217,6 +253,9 @@ You have LIVE data fetched RIGHT NOW from global meteorological APIs (Open-Meteo
 **Flood risk** ("flood risk?", "is flooding likely?"):
 → "Flood risk is **[level]** (**X%** probability). Soil **Y%** saturated, rainfall **Z mm/h**. [Safe/evacuate/caution]. *[Tip].*"
 
+**Cyclone risk** ("cyclone risk?", "is there a cyclone?", "cyclone warning?"):
+→ "Cyclone risk is **[level]** (**X%** probability) — **[IMD Category]**. Wind gusts **W km/h**, pressure **P hPa**. [GDACS warning if active]. *[Evacuation/shelter tip].*"
+
 **Comparison** ("is Mysore better than Bangalore for travel?"):
 → Compare both cities side by side with actual data. Give a clear recommendation.
 
@@ -231,6 +270,7 @@ Use this structure:
 💨 **Wind & Visibility**: [conditions]
 🌿 **Air Quality**: [AQI + label + advice]
 🏞️ **Flood Risk**: [level + probability]
+🌀 **Cyclone Risk**: [level + IMD category + wind gusts]
 ✅ **Verdict**: [1 sentence overall assessment]
 """
 
@@ -241,6 +281,7 @@ def get_ai_response(
     weather_data: dict | None,
     flood_data: dict | None = None,
     requested_weather: dict | None = None,
+    cyclone_data: dict | None = None,
 ) -> dict:
     if not _key_ok():
         return {
@@ -255,7 +296,7 @@ def get_ai_response(
             "suggestions": ["Will it rain today?", "Is it safe to drive?", "Flood risk in my area?"],
         }
 
-    weather_context = _build_weather_context(weather_data, flood_data, requested_weather)
+    weather_context = _build_weather_context(weather_data, flood_data, requested_weather, cyclone_data)
     system_prompt   = _SYSTEM.format(weather_context=weather_context)
 
     msgs = [{"role": "system", "content": system_prompt}]
@@ -308,6 +349,8 @@ def _suggestions(user_msg: str, resp: str = "") -> list[str]:
         return ["Is it safe to go out?", "Storm duration forecast?", "Emergency contacts?"]
     if any(w in m for w in ["air", "aqi", "quality", "pollution", "smog"]):
         return ["Is it safe to exercise outside?", "Best time for outdoor activity?", "Flood risk in my area?"]
+    if any(w in m for w in ["cyclone", "hurricane", "tropical", "storm surge", "landfall", "imd", "depression", "severe cyclonic"]):
+        return ["Is it safe to stay here?", "What to pack for cyclone evacuation?", "Flood risk in my area?"]
     if any(w in m for w in ["climate", "analyze", "analysis", "mysore", "bangalore", "chennai", "mumbai", "delhi", "hyderabad", "kolkata", "pune"]):
         return ["Will it rain there tomorrow?", "Is it safe to travel there?", "Compare with my location"]
-    return ["Will it rain tomorrow?", "Flood risk in my area?", "Is it safe to travel today?"]
+    return ["Will it rain tomorrow?", "Cyclone risk in my area?", "Is it safe to travel today?"]

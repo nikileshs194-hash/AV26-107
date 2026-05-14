@@ -4,13 +4,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routes.weather import router as weather_router
-from routes.alerts  import router as alerts_router
-from routes.chat    import router as chat_router
-from routes.sos     import router as sos_router
-from routes.predict import router as predict_router
-from routes.auth    import router as auth_router
-from routes.admin   import router as admin_router
+from routes.weather  import router as weather_router
+from routes.alerts   import router as alerts_router
+from routes.chat     import router as chat_router
+from routes.sos      import router as sos_router
+from routes.predict  import router as predict_router
+from routes.auth     import router as auth_router
+from routes.admin    import router as admin_router
+from routes.cyclone  import router as cyclone_router
 
 from services.scheduler import run_scheduler
 
@@ -50,6 +51,7 @@ app.include_router(sos_router)
 app.include_router(predict_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(cyclone_router)
 
 
 @app.get("/")

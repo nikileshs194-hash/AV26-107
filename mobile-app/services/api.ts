@@ -211,6 +211,40 @@ export const fetchFloodPrediction = async (lat: number, lon: number): Promise<Fl
   return res.data;
 };
 
+// ── Cyclone prediction ────────────────────────────────────────────────────────
+
+export interface CycloneFeatures {
+  wind_speed_kmh: number;
+  wind_gusts_kmh: number;
+  surface_pressure_hpa: number;
+  pressure_6h_ago_hpa: number;
+  pressure_drop_6h: number;
+  cape_jkg: number;
+  precipitation_mm: number;
+  coastal_proximity_km: number;
+  season_factor: number;
+  gdacs_active: boolean;
+  gdacs_name: string;
+  gdacs_distance_km: number;
+  gdacs_alert_level: string;
+}
+
+export interface CyclonePrediction {
+  cyclone_risk: 'Very Low' | 'Low' | 'Moderate' | 'High' | 'Extreme';
+  probability: number;
+  category: string;
+  cyclone_likely: boolean;
+  features: CycloneFeatures;
+  advice: string[];
+  data_sources: string[];
+  forecast_window: string;
+}
+
+export const fetchCyclonePrediction = async (lat: number, lon: number): Promise<CyclonePrediction> => {
+  const res = await api.get('/api/cyclone', { params: { lat, lon }, timeout: 30000 });
+  return res.data;
+};
+
 // ── Alerts (DB-backed) ────────────────────────────────────────────────────────
 
 /** Save freshly fetched alerts to DB for a user */

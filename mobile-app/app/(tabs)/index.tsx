@@ -12,9 +12,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import useLocation from '@/hooks/useLocation';
 import { useAuth } from '@/context/AuthContext';
 import {
-  fetchWeather, fetchFloodPrediction,
+  fetchWeather, fetchFloodPrediction, fetchCyclonePrediction,
   sendSOS, notifyNearby, findNearest,
-  FloodPrediction, WeatherResponse,
+  FloodPrediction, WeatherResponse, CyclonePrediction,
 } from '@/services/api';
 
 // ─── Flood Prediction Card ────────────────────────────────────────────────────
@@ -111,6 +111,105 @@ const fpStyles = StyleSheet.create({
   tipText: { fontFamily: 'PlusJakartaSans_400Regular', fontSize: 12, flex: 1, lineHeight: 17 },
 });
 
+// ─── Cyclone Prediction Card ──────────────────────────────────────────────────
+
+const CYCLONE_COLORS: Record<string, { bg: string; border: string; text: string; badge: string }> = {
+  'Very Low': { bg: '#f5f3ff', border: '#c4b5fd', text: '#4c1d95', badge: '#7c3aed' },
+  'Low':      { bg: '#f5f3ff', border: '#c4b5fd', text: '#4c1d95', badge: '#7c3aed' },
+  'Moderate': { bg: '#ede9fe', border: '#a78bfa', text: '#3730a3', badge: '#6d28d9' },
+  'High':     { bg: '#e0e7ff', border: '#818cf8', text: '#1e1b4b', badge: '#4f46e5' },
+  'Extreme':  { bg: '#fdf4ff', border: '#d946ef', text: '#4a044e', badge: '#a21caf' },
+};
+
+function CyclonePredictionCard({ data }: { data: CyclonePrediction }) {
+  const c   = CYCLONE_COLORS[data.cyclone_risk] ?? CYCLONE_COLORS['Low'];
+  const pct = Math.round(data.probability * 100);
+  const f   = data.features;
+
+  return (
+    <View style={[fpStyles.card, { backgroundColor: c.bg, borderColor: c.border }]}>
+      {/* Header */}
+      <View style={fpStyles.header}>
+        <View style={fpStyles.headerLeft}>
+          <Ionicons name="thunderstorm-outline" size={20} color={c.text} />
+          <Text style={[fpStyles.title, { color: c.text }]}>AI CYCLONE FORECAST</Text>
+        </View>
+        <View style={[fpStyles.windowBadge, { backgroundColor: c.border }]}>
+          <Ionicons name="navigate-outline" size={11} color={c.text} />
+          <Text style={[fpStyles.windowText, { color: c.text }]}> Live conditions</Text>
+        </View>
+      </View>
+
+      {/* Risk level + probability circle */}
+      <View style={fpStyles.riskRow}>
+        <View style={{ flex: 1 }}>
+          <Text style={[fpStyles.riskLevel, { color: c.text }]}>{data.cyclone_risk} Risk</Text>
+          <Text style={[fpStyles.riskSub, { color: c.text }]}>{data.category}</Text>
+          {/* GDACS active badge */}
+          {f.gdacs_active && (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6,
+              backgroundColor: '#fef2f2', borderRadius: 12, paddingHorizontal: 8, paddingVertical: 3,
+              alignSelf: 'flex-start', borderWidth: 1, borderColor: '#fca5a5' }}>
+              <Ionicons name="warning-outline" size={11} color="#dc2626" />
+              <Text style={{ fontSize: 10, color: '#dc2626', fontFamily: 'PlusJakartaSans_600SemiBold' }}>
+                Active: {f.gdacs_name || 'Cyclone Nearby'}
+              </Text>
+            </View>
+          )}
+        </View>
+        <View style={[fpStyles.probCircle, { borderColor: c.badge }]}>
+          <Text style={[fpStyles.probNum, { color: c.badge }]}>{pct}%</Text>
+          <Text style={[fpStyles.probLabel, { color: c.text }]}>risk</Text>
+        </View>
+      </View>
+
+      {/* Key signals */}
+      <View style={fpStyles.signals}>
+        <View style={fpStyles.signal}>
+          <Ionicons name="thunderstorm-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            Gusts {f.wind_gusts_kmh.toFixed(0)} km/h
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="speedometer-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            {f.surface_pressure_hpa.toFixed(0)} hPa
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="trending-down-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            {f.pressure_drop_6h > 0 ? `↓${f.pressure_drop_6h} hPa/6h` : 'Stable pressure'}
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="location-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            {f.coastal_proximity_km < 1000
+              ? `${f.coastal_proximity_km.toFixed(0)} km coast`
+              : 'Inland'}
+          </Text>
+        </View>
+      </View>
+
+      {/* Top advice tips */}
+      {data.advice.slice(0, 2).map((tip, i) => (
+        <View key={i} style={fpStyles.tip}>
+          <Ionicons name="alert-circle-outline" size={13} color={c.badge} style={{ marginTop: 1 }} />
+          <Text style={[fpStyles.tipText, { color: c.text }]}>{tip}</Text>
+        </View>
+      ))}
+
+      {/* Data sources */}
+      <Text style={{ fontFamily: 'PlusJakartaSans_400Regular', fontSize: 10,
+        color: c.text, opacity: 0.55, marginTop: 6 }}>
+        Sources: {data.data_sources.join(' · ')} · IMD Scale
+      </Text>
+    </View>
+  );
+}
+
 // ─── Risk Gauge ──────────────────────────────────────────────────────────────
 
 function RiskGauge({ level = 'Low', color = '#4CAF50' }: { level: string; color: string }) {
@@ -157,6 +256,7 @@ export default function DashboardScreen() {
   const { user } = useAuth();
   const [weather, setWeather] = useState<WeatherResponse | null>(null);
   const [flood, setFlood] = useState<FloodPrediction | null>(null);
+  const [cyclone, setCyclone] = useState<CyclonePrediction | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -203,12 +303,14 @@ export default function DashboardScreen() {
     isRefresh ? setRefreshing(true) : setLoading(true);
     setError(null);
     try {
-      const [weatherData, floodData] = await Promise.all([
+      const [weatherData, floodData, cycloneData] = await Promise.all([
         fetchWeather(location.lat, location.lon),
         fetchFloodPrediction(location.lat, location.lon).catch(() => null),
+        fetchCyclonePrediction(location.lat, location.lon).catch(() => null),
       ]);
       setWeather(weatherData);
       setFlood(floodData);
+      setCyclone(cycloneData);
     } catch (e: any) {
       setError(e.message || 'Failed to load weather');
     } finally {
@@ -480,6 +582,9 @@ export default function DashboardScreen() {
 
       {/* AI Flood Prediction */}
       {flood && <FloodPredictionCard data={flood} />}
+
+      {/* AI Cyclone Prediction */}
+      {cyclone && <CyclonePredictionCard data={cyclone} />}
 
       {/* ── Emergency Section ── */}
       <View style={{ marginBottom: 8 }}>

@@ -454,7 +454,132 @@ async def weather_tip_loop() -> None:
         await asyncio.sleep(WEATHER_TIP_SECS)
 
 
-# ── LOOP 3 — Daily chat cleanup at midnight IST ───────────────────────────────
+# ── LOOP 3 — Cyclone check (every 60 seconds) ────────────────────────────────
+
+_cyclone_cooldown: dict[str, datetime] = {}   # { phone: last_alert_datetime }
+CYCLONE_COOLDOWN_SECS = 30 * 60              # 30-min gap between cyclone alerts
+
+_CYCLONE_COLORS = {
+    "Extreme":  {"bg": "#F3E5F5", "border": "#7B1FA2", "icon_bg": "#F3E5F5", "icon_color": "#7B1FA2"},
+    "High":     {"bg": "#EDE7F6", "border": "#512DA8", "icon_bg": "#EDE7F6", "icon_color": "#512DA8"},
+    "Moderate": {"bg": "#E8EAF6", "border": "#3949AB", "icon_bg": "#E8EAF6", "icon_color": "#3949AB"},
+}
+
+
+def _run_cyclone_check_sync(users: list[dict]) -> list[dict]:
+    """
+    Run cyclone prediction for all users. Returns push payloads to send.
+    Called via asyncio.to_thread so it doesn't block the event loop.
+    """
+    try:
+        from services.cyclone_service import predict_cyclone
+    except Exception as e:
+        logger.warning(f"[CycloneCheck] import error: {e}")
+        return []
+
+    now      = datetime.now(timezone.utc)
+    messages = []
+
+    for u in users:
+        lat, lon = float(u["latitude"]), float(u["longitude"])
+        phone    = u.get("phone", "")
+
+        # Cooldown guard
+        last = _cyclone_cooldown.get(phone)
+        if last and (now - last).total_seconds() < CYCLONE_COOLDOWN_SECS:
+            continue
+
+        try:
+            result = predict_cyclone(lat, lon)
+            risk   = result["cyclone_risk"]
+            prob   = result["probability"]
+        except Exception as e:
+            logger.warning(f"[CycloneCheck] predict error ({phone}): {e}")
+            continue
+
+        if risk not in ("High", "Extreme"):
+            continue
+
+        _cyclone_cooldown[phone] = now
+
+        feat     = result["features"]
+        pct      = round(prob * 100)
+        category = result["category"]
+        now_str  = now.strftime("%H:%M")
+        colors   = _CYCLONE_COLORS.get(risk, _CYCLONE_COLORS["High"])
+
+        gdacs_line = ""
+        if feat["gdacs_active"]:
+            gdacs_line = f" Active cyclone '{feat['gdacs_name']}' is {feat['gdacs_distance_km']:.0f} km away."
+
+        desc = (
+            f"{risk} cyclone risk ({pct}%) — {category}.{gdacs_line} "
+            f"Wind gusts {feat['wind_gusts_kmh']} km/h, pressure {feat['surface_pressure_hpa']} hPa."
+        )
+
+        # ── Save alert card → Alerts tab ─────────────────────────────────────
+        _save_alert_to_db(phone, {
+            "alert_id":    f"cyclone_{phone}_{int(now.timestamp())}",
+            "title":       f"🌀 Cyclone Alert — {risk} Risk",
+            "description": desc,
+            "severity":    risk,
+            "source":      "Cyclone AI Model",
+            "location":    f"{round(lat, 4)}, {round(lon, 4)}",
+            "icon":        "thunderstorm",
+            "icon_bg":     colors["icon_bg"],
+            "icon_color":  colors["icon_color"],
+            "border_color": colors["border"],
+            "when_text":   f"{risk} · {now_str}",
+            "when_color":  colors["border"],
+        })
+
+        # ── Push notification ─────────────────────────────────────────────────
+        messages.append({
+            "to":        u["push_token"],
+            "title":     f"🌀 CYCLONE ALERT — {risk.upper()}",
+            "body":      (
+                f"{category} conditions ({pct}% risk). "
+                f"Gusts: {feat['wind_gusts_kmh']} km/h. "
+                f"Pressure: {feat['surface_pressure_hpa']} hPa. Stay safe."
+            ),
+            "sound":     "default",
+            "priority":  "high",
+            "badge":     1,
+            "channelId": "sos",
+            "data": {
+                "type":          "cyclone_alert",
+                "risk_level":    risk,
+                "probability":   prob,
+                "category":      category,
+                "wind_gusts":    feat["wind_gusts_kmh"],
+                "pressure":      feat["surface_pressure_hpa"],
+                "gdacs_active":  feat["gdacs_active"],
+                "user_lat":      lat,
+                "user_lon":      lon,
+            },
+        })
+        logger.info(f"[CycloneCheck] 🌀 {risk} risk ({pct}%) for {phone} — alert queued")
+
+    return messages
+
+
+async def cyclone_check_loop() -> None:
+    """Runs every 60 seconds. Fires cyclone alert when risk = High or Extreme."""
+    logger.info("[CycloneCheck] Loop started — checking every 60 s")
+    while True:
+        try:
+            users = await asyncio.to_thread(_get_all_users_with_token)
+            if users:
+                messages = await asyncio.to_thread(_run_cyclone_check_sync, users)
+                if messages:
+                    await asyncio.to_thread(_send_pushes, messages)
+        except Exception as e:
+            logger.error(f"[CycloneCheck] Loop error: {e}")
+
+        await asyncio.sleep(FLOOD_CHECK_SECS)   # same 60-second interval as flood
+
+
+# ── LOOP 4 — Daily chat cleanup at midnight IST ───────────────────────────────
 
 from datetime import timezone, timedelta as _td
 _IST = timezone(_td(hours=5, minutes=30))
@@ -495,6 +620,7 @@ async def run_scheduler() -> None:
     logger.info("[Scheduler] Starting all loops...")
     await asyncio.gather(
         flood_check_loop(),
+        cyclone_check_loop(),
         weather_tip_loop(),
         chat_cleanup_loop(),
     )

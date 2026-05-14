@@ -203,6 +203,7 @@ def chat(req: ChatRequest):
     try:
         weather_data      = None
         flood_data        = None
+        cyclone_data      = None
         requested_weather = None
 
         # ── City mentioned in message → fetch its weather ────────────────────
@@ -211,7 +212,7 @@ def chat(req: ChatRequest):
         except Exception as e:
             print(f"[CHAT] City weather extraction failed: {e}")
 
-        # ── GPS location weather + flood prediction ──────────────────────────
+        # ── GPS location weather + flood + cyclone prediction ───────────────
         if req.lat is not None and req.lon is not None:
             try:
                 weather_data = get_full_weather(req.lat, req.lon)
@@ -248,6 +249,12 @@ def chat(req: ChatRequest):
             except Exception as e:
                 print(f"[CHAT] Flood prediction fetch failed: {e}")
 
+            try:
+                from services.cyclone_service import predict_cyclone
+                cyclone_data = predict_cyclone(req.lat, req.lon)
+            except Exception as e:
+                print(f"[CHAT] Cyclone prediction fetch failed: {e}")
+
         # ── Load DB history for today if phone provided ──────────────────────
         if req.phone and not req.history:
             db_rows = _load_today_history(req.phone)
@@ -258,7 +265,8 @@ def chat(req: ChatRequest):
         # ── Get AI response ──────────────────────────────────────────────────
         result = get_ai_response(
             req.message, history, weather_data, flood_data,
-            requested_weather=requested_weather
+            requested_weather=requested_weather,
+            cyclone_data=cyclone_data,
         )
 
         # ── Persist to DB ────────────────────────────────────────────────────
