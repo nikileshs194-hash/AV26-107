@@ -15,62 +15,60 @@ def _key_ok() -> bool:
     return bool(GROQ_API_KEY and len(GROQ_API_KEY) > 10)
 
 
-def _build_weather_context(weather: dict | None, flood: dict | None) -> str:
+def _build_weather_block(label: str, weather: dict, flood: dict | None = None) -> list[str]:
+    """Build a weather context block for a given location."""
     lines = []
+    c      = weather.get("current", {})
+    daily  = weather.get("daily",   [])
+    hourly = weather.get("hourly",  [])
 
-    # ── Current weather ──────────────────────────────────────────────────────
-    if weather:
-        c = weather.get("current", {})
-        daily  = weather.get("daily",  [])
-        hourly = weather.get("hourly", [])
+    city    = c.get("city", "Unknown")
+    country = c.get("country", "")
+    state   = c.get("state", "")
+    loc_str = ", ".join(filter(None, [city, state, country]))
 
-        lines += [
-            "=== CURRENT WEATHER (LIVE, RIGHT NOW) ===",
-            f"Location     : {c.get('city', 'Unknown')}, {c.get('country', '')}",
-            f"Temperature  : {c.get('temp')}°C  (feels like {c.get('feels_like')}°C)",
-            f"Today range  : {c.get('temp_min')}°C min — {c.get('temp_max')}°C max",
-            f"Sky          : {c.get('description', c.get('condition', 'N/A'))}",
-            f"Humidity     : {c.get('humidity')}%",
-            f"Wind         : {c.get('wind_speed')} km/h {c.get('wind_dir', '')}",
-            f"Pressure     : {c.get('pressure')} hPa",
-            f"UV Index     : {c.get('uv_label', c.get('uv_index', 'N/A'))}",
-            f"Visibility   : {c.get('visibility')} km",
-            f"Rainfall 1h  : {c.get('rain_1h', 0)} mm",
-        ]
-        aq = c.get("air_quality", {})
-        if aq:
-            lines.append(f"Air Quality  : {aq.get('label', 'N/A')}  (AQI {aq.get('aqi', 'N/A')})")
+    lines += [
+        f"=== {label}: {loc_str} ===",
+        f"Temperature  : {c.get('temp')}°C  (feels like {c.get('feels_like')}°C)",
+        f"Today range  : {c.get('temp_min')}°C min — {c.get('temp_max')}°C max",
+        f"Sky          : {c.get('description', c.get('condition', 'N/A'))}",
+        f"Humidity     : {c.get('humidity')}%",
+        f"Wind         : {c.get('wind_speed')} km/h {c.get('wind_dir', '')}",
+        f"Pressure     : {c.get('pressure')} hPa",
+        f"UV Index     : {c.get('uv_label', c.get('uv_index', 'N/A'))}",
+        f"Visibility   : {c.get('visibility')} km",
+        f"Rainfall 1h  : {c.get('rain_1h', 0)} mm",
+    ]
+    aq = c.get("air_quality", {})
+    if aq:
+        lines.append(f"Air Quality  : {aq.get('label', 'N/A')}  (AQI {aq.get('aqi', 'N/A')})")
 
-        # Next 6 hours
-        if hourly:
-            lines.append("\n=== NEXT 6 HOURS ===")
-            for h in hourly[:6]:
-                lines.append(
-                    f"  {h['time']:>5}  {h['condition']:<22}  {h['temp']}°C  "
-                    f"Rain {h['rain_prob']}%"
-                )
+    # Next 6 hours
+    if hourly:
+        lines.append(f"\n--- Next 6 Hours ({city}) ---")
+        for h in hourly[:6]:
+            lines.append(
+                f"  {h['time']:>5}  {h['condition']:<22}  {h['temp']}°C  "
+                f"Rain {h['rain_prob']}%"
+            )
 
-        # 7-day forecast — label today and tomorrow explicitly
-        if daily:
-            today_label    = datetime.now().strftime("%a")   # e.g. "Wed"
-            tomorrow_label = (datetime.now() + timedelta(days=1)).strftime("%a")
-            lines.append("\n=== 7-DAY FORECAST ===")
-            for i, d in enumerate(daily[:7]):
-                tag = ""
-                if i == 0: tag = " ← TODAY"
-                elif i == 1: tag = " ← TOMORROW"
-                lines.append(
-                    f"  {d['day']}{tag:<12}  {d['condition']:<22}  "
-                    f"{d['temp_min']}–{d['temp_max']}°C  Rain {d['rain_prob']}%"
-                )
-    else:
-        lines.append("=== WEATHER === No live weather data available for this session.")
+    # 7-day forecast with TODAY / TOMORROW labels
+    if daily:
+        lines.append(f"\n--- 7-Day Forecast ({city}) ---")
+        for i, d in enumerate(daily[:7]):
+            tag = ""
+            if i == 0:   tag = " ← TODAY"
+            elif i == 1: tag = " ← TOMORROW"
+            lines.append(
+                f"  {d['day']}{tag:<12}  {d['condition']:<22}  "
+                f"{d['temp_min']}–{d['temp_max']}°C  Rain {d['rain_prob']}%"
+            )
 
-    # ── Flood prediction ─────────────────────────────────────────────────────
+    # Flood prediction (only for user's own location)
     if flood:
         pct = round(flood["probability"] * 100)
         lines += [
-            "\n=== AI FLOOD PREDICTION (CURRENT CONDITIONS) ===",
+            f"\n--- Flood Prediction ({city}) ---",
             f"Flood risk level  : {flood['risk_level']}",
             f"Flood probability : {pct}%",
             f"Flood likely      : {'YES' if flood['flood_likely'] else 'NO'}",
@@ -81,39 +79,72 @@ def _build_weather_context(weather: dict | None, flood: dict | None) -> str:
             f"Elevation         : {flood['elevation']} m above sea level",
             f"Drainage score    : {flood['drainage']} / 10",
         ]
-    else:
-        lines.append("\n=== FLOOD PREDICTION === Not available for this session.")
+
+    return lines
+
+
+def _build_weather_context(
+    weather: dict | None,
+    flood: dict | None,
+    requested_weather: dict | None = None,
+) -> str:
+    lines = []
+
+    # ── Requested city weather (highest priority — user asked about this) ─────
+    if requested_weather:
+        lines += _build_weather_block(
+            "LIVE WEATHER FOR REQUESTED CITY", requested_weather
+        )
+        lines.append("")
+
+    # ── User's current GPS location weather ───────────────────────────────────
+    if weather:
+        lines += _build_weather_block(
+            "USER'S CURRENT LOCATION WEATHER", weather, flood
+        )
+    elif not requested_weather:
+        lines.append("=== WEATHER === No live weather data available for this session.")
 
     return "\n".join(lines)
 
 
 _SYSTEM = """You are **JeevanSetu AI** — a highly accurate, real-time weather and flood-safety assistant built into a disaster-preparedness app used in India.
 
-You have been given LIVE weather data and AI flood prediction for the user's EXACT location right now. Always use this data to answer — never say you don't have weather information.
+You have been given LIVE real-time weather data fetched right now. Use it to give precise, helpful answers.
 
 {weather_context}
 
 ---
 
 STRICT RULES:
-1. **Always use the live data above** to answer. Never say "I don't have weather data" — you do.
-2. For "Can I go out tomorrow?" or "Is it safe?" questions → check tomorrow's forecast rain probability, flood risk, and give a YES/NO recommendation with the specific numbers.
-3. For "Will it rain?" → give the EXACT rain probability % from the forecast for that day/time.
-4. For flood risk questions → use the flood prediction data (probability %, risk level, soil moisture).
-5. Keep answers short and direct: 2–4 sentences. Use bullet points only for complex queries.
-6. **Bold** key values: temperatures, percentages, risk levels, day names.
-7. End with a short *italic safety tip* when relevant.
-8. Respond in the same language the user writes in (English, Kannada, or Hindi).
-9. If the question is completely unrelated to weather/safety/floods, politely decline.
+1. **ALWAYS use the live data above** to answer. NEVER say "I don't have weather data" — you always do.
+2. If the data shows **LIVE WEATHER FOR REQUESTED CITY**, the user asked about that city — answer using THAT data only.
+3. If there is no requested-city data but user asks about a city, say: "I fetched data for your current location. For [City], the weather couldn't be retrieved — please try asking again."
+4. For "Will it rain?" → give the EXACT rain probability % from the forecast for that day.
+5. For "Can I go out tomorrow?" or "Is it safe?" → check tomorrow's forecast rain %, temperature, flood risk → give YES/NO with specific numbers.
+6. For flood risk → use flood prediction data (probability %, risk level, soil moisture).
+7. Keep answers SHORT and direct: 2–4 sentences max. Use bullet points only for multi-day queries.
+8. **Bold** key values: temperatures, percentages, risk levels, day names.
+9. End with a short *italic safety tip* when relevant.
+10. Respond in the same language the user writes in (English, Kannada, or Hindi).
+11. If the question is completely unrelated to weather/safety/floods, politely decline.
+12. NEVER make up data. If a field is missing, skip it — don't invent numbers.
 
 ANSWER STYLE EXAMPLES:
-- "Is it safe to go out tomorrow?" → "**Tomorrow** looks [condition]. Rain probability is **X%**, temperature **Y–Z°C**. Flood risk is **[level]**. [Yes/No, it is/isn't a good idea to go out]. *[Safety tip].*"
-- "Will it rain this weekend?" → "**Saturday**: [condition], **X%** rain chance. **Sunday**: [condition], **Y%** rain chance. [Brief advice]. *[Tip].*"
-- "What is the flood risk?" → "Current flood risk is **[level]** with a **X%** probability. Soil is **Y%** saturated. [Brief advice]. *[Tip].*"
+- "Mysore" or "Weather in Mysore" → "In **Mysore**, it's currently **[condition]**, **X°C** (feels like Y°C). Tomorrow: **[condition]**, **A–B°C**, rain chance **Z%**. *[Safety tip].*"
+- "Is it safe to go to Mysore?" → "In **Mysore** right now: **[condition]**, **X°C**, rain chance **Z%** tomorrow. [Yes/No, safe/risky because...]. *[Tip].*"
+- "Will it rain tomorrow?" → "**Tomorrow** in **[City]**: **[condition]**, rain probability **X%**, **Y–Z°C**. [Safe/bring umbrella advice]. *[Tip].*"
+- "What is the flood risk?" → "Current flood risk is **[level]** with **X%** probability. Soil is **Y%** saturated. [Advice]. *[Tip].*"
 """
 
 
-def get_ai_response(message: str, history: list, weather_data: dict | None, flood_data: dict | None = None) -> dict:
+def get_ai_response(
+    message: str,
+    history: list,
+    weather_data: dict | None,
+    flood_data: dict | None = None,
+    requested_weather: dict | None = None,
+) -> dict:
     if not _key_ok():
         return {
             "response": (
@@ -127,7 +158,7 @@ def get_ai_response(message: str, history: list, weather_data: dict | None, floo
             "suggestions": ["Will it rain today?", "Is it safe to drive?", "Flood risk in my area?"],
         }
 
-    weather_context = _build_weather_context(weather_data, flood_data)
+    weather_context = _build_weather_context(weather_data, flood_data, requested_weather)
     system_prompt   = _SYSTEM.format(weather_context=weather_context)
 
     msgs = [{"role": "system", "content": system_prompt}]
@@ -146,7 +177,7 @@ def get_ai_response(message: str, history: list, weather_data: dict | None, floo
                 "model":       _GROQ_MODEL,
                 "messages":    msgs,
                 "max_tokens":  500,
-                "temperature": 0.4,   # lower = more factual, less hallucination
+                "temperature": 0.3,   # lower = more factual, less hallucination
             },
             timeout=30,
         )
@@ -178,4 +209,6 @@ def _suggestions(user_msg: str, resp: str = "") -> list[str]:
         return ["How to stay safe in heat?", "UV index forecast?", "Best outdoor time today?"]
     if any(w in m for w in ["wind", "storm", "cyclone", "thunder"]):
         return ["Is it safe to go out?", "Storm duration forecast?", "Emergency contacts?"]
+    if any(w in m for w in ["mysore", "bangalore", "chennai", "mumbai", "delhi", "hyderabad"]):
+        return ["Will it rain there tomorrow?", "Flood risk in that area?", "Is it safe to travel there?"]
     return ["Will it rain tomorrow?", "Flood risk in my area?", "Is it safe to travel today?"]

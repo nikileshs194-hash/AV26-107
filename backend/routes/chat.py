@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel
 import requests as _req
+import re
 from services.ai_service import get_ai_response
-from services.weather_service import get_full_weather
+from services.weather_service import get_full_weather, geocode_city
 from config import GROQ_API_KEY
 
 router = APIRouter(prefix="/api/chat", tags=["ai"])
@@ -21,6 +22,75 @@ _AUDIO_MIME: dict[str, str] = {
     "opus": "audio/opus",
 }
 
+# Words that look like city names but aren't
+_NON_CITY_WORDS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "today", "tomorrow", "yesterday", "morning", "evening", "night", "afternoon",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "rain", "flood", "weather", "safe", "risk", "high", "low", "moderate",
+    "india", "help", "what", "how", "will", "can", "should", "is", "are",
+    "please", "thank", "okay", "yes", "no", "the", "and", "for", "not",
+    "groq", "ai", "app", "data", "forecast", "chance", "probability",
+}
+
+
+def _extract_city_candidates(message: str) -> list[str]:
+    """
+    Extract potential city names from a user message.
+    Returns a prioritized list of candidates to try geocoding.
+    """
+    candidates = []
+
+    # Pattern 1: after prepositions — "weather in Mysore", "travel to Bangalore"
+    prep_matches = re.findall(
+        r'\b(?:in|for|at|to|about|near|around|of)\s+([A-Za-z][a-zA-Z\s]{1,25}?)(?:\s*[?,.]|$)',
+        message
+    )
+    for m in prep_matches:
+        c = m.strip().title()
+        if c.lower() not in _NON_CITY_WORDS and len(c) > 2:
+            candidates.append(c)
+
+    # Pattern 2: full message is just a city name (like user typed "Mysore")
+    stripped = message.strip().rstrip("?.,!")
+    if 2 < len(stripped) < 30 and re.match(r'^[A-Za-z][a-zA-Z\s]+$', stripped):
+        c = stripped.title()
+        if c.lower() not in _NON_CITY_WORDS:
+            candidates.insert(0, c)  # highest priority
+
+    # Pattern 3: capitalized words that look like proper nouns
+    cap_matches = re.findall(r'\b([A-Z][a-z]{2,15}(?:\s+[A-Z][a-z]{2,15})?)\b', message)
+    for m in cap_matches:
+        c = m.strip()
+        if c.lower() not in _NON_CITY_WORDS and c not in candidates:
+            candidates.append(c)
+
+    return candidates
+
+
+def _get_city_weather(message: str) -> dict | None:
+    """
+    Try to extract a city name from the message, geocode it, and fetch its weather.
+    Returns weather dict or None if no city found / geocoding failed.
+    """
+    candidates = _extract_city_candidates(message)
+    for city in candidates:
+        print(f"[CHAT] Trying to geocode city candidate: '{city}'")
+        geo = geocode_city(city)
+        if geo:
+            print(f"[CHAT] Geocoded '{city}' → {geo['city']}, {geo['country']} ({geo['lat']}, {geo['lon']})")
+            try:
+                weather = get_full_weather(geo["lat"], geo["lon"])
+                # Override city name with the geocoded canonical name
+                weather["current"]["city"] = geo["city"]
+                weather["current"]["country"] = geo["country"]
+                weather["current"]["state"] = geo.get("state", "")
+                return weather
+            except Exception as e:
+                print(f"[CHAT] Weather fetch failed for geocoded city '{city}': {e}")
+    return None
+
 
 class ChatMessage(BaseModel):
     role: str
@@ -37,17 +107,23 @@ class ChatRequest(BaseModel):
 @router.post("")
 def chat(req: ChatRequest):
     try:
-        weather_data  = None
-        flood_data    = None
+        weather_data       = None   # user's GPS location weather
+        flood_data         = None   # flood prediction for user's location
+        requested_weather  = None   # weather for a city the user asked about
 
+        # ── Fetch weather for any city mentioned in the message ──────────────
+        try:
+            requested_weather = _get_city_weather(req.message)
+        except Exception as e:
+            print(f"[CHAT] City weather extraction failed: {e}")
+
+        # ── Fetch real-time weather + flood for user's GPS location ──────────
         if req.lat is not None and req.lon is not None:
-            # ── Fetch real-time weather ──────────────────────────────────────
             try:
                 weather_data = get_full_weather(req.lat, req.lon)
             except Exception as e:
-                print(f"[CHAT] Weather fetch failed: {e}")
+                print(f"[CHAT] GPS weather fetch failed: {e}")
 
-            # ── Fetch flood prediction ───────────────────────────────────────
             try:
                 from routes.predict import _fetch_features, _model
                 import pandas as pd
@@ -79,7 +155,10 @@ def chat(req: ChatRequest):
                 print(f"[CHAT] Flood prediction fetch failed: {e}")
 
         history = [{"role": m.role, "content": m.content} for m in req.history]
-        return get_ai_response(req.message, history, weather_data, flood_data)
+        return get_ai_response(
+            req.message, history, weather_data, flood_data,
+            requested_weather=requested_weather
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

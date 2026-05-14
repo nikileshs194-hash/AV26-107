@@ -89,6 +89,36 @@ def _naqi_from_pm25(pm25: float) -> tuple[int, str, str]:
     return 500, "Severe", "#7B1FA2"
 
 
+# ─── Geocoding: city name → (lat, lon, city, country) — no API key needed ───
+
+def geocode_city(city_name: str) -> dict | None:
+    """
+    Convert a city/place name to coordinates using Open-Meteo Geocoding API.
+    Completely free — no API key required.
+    Returns {"lat", "lon", "city", "country"} or None if not found.
+    """
+    try:
+        url = (
+            f"https://geocoding-api.open-meteo.com/v1/search"
+            f"?name={requests.utils.quote(city_name)}&count=1&language=en&format=json"
+        )
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if results:
+            res = results[0]
+            return {
+                "lat":     res["latitude"],
+                "lon":     res["longitude"],
+                "city":    res.get("name", city_name),
+                "country": res.get("country", ""),
+                "state":   res.get("admin1", ""),
+            }
+    except Exception:
+        pass
+    return None
+
+
 # ─── City name from OWM (only field we need from it) ────────────────────────
 
 def _get_city_info(lat: float, lon: float) -> dict:
