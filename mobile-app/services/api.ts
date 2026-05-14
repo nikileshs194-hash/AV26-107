@@ -76,14 +76,37 @@ export const fetchAlerts = async (lat: number, lon: number): Promise<AlertsRespo
   return res.data;
 };
 
+export interface ChatHistoryMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  time: string;
+}
+
+export interface ChatHistoryResponse {
+  phone: string;
+  date: string;
+  messages: ChatHistoryMessage[];
+  count: number;
+}
+
 export const sendChatMessage = async (
   message: string,
   history: { role: string; content: string }[],
   lat?: number,
   lon?: number,
+  phone?: string,
 ): Promise<ChatResponse> => {
-  const res = await api.post('/api/chat', { message, history, lat, lon }, { timeout: 30000 });
+  const res = await api.post('/api/chat', { message, history, lat, lon, phone }, { timeout: 30000 });
   return res.data;
+};
+
+export const fetchChatHistory = async (phone: string): Promise<ChatHistoryResponse> => {
+  const res = await api.get('/api/chat/history', { params: { phone } });
+  return res.data;
+};
+
+export const clearChatHistory = async (phone: string): Promise<void> => {
+  await api.delete('/api/chat/history', { params: { phone } });
 };
 
 // ── Emergency / SOS ──────────────────────────────────────────────────────────

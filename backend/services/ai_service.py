@@ -8,15 +8,67 @@ from config import GROQ_API_KEY
 from datetime import datetime, timezone, timedelta
 
 _GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-_GROQ_MODEL = "llama-3.3-70b-versatile"   # free, fast (~300 tok/s)
+_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 def _key_ok() -> bool:
     return bool(GROQ_API_KEY and len(GROQ_API_KEY) > 10)
 
 
+def _wind_analysis(speed: float) -> str:
+    if speed < 5:   return "Calm"
+    if speed < 15:  return "Light breeze"
+    if speed < 30:  return "Moderate wind"
+    if speed < 50:  return "Strong wind — driving caution advised"
+    return "Dangerous wind speeds — avoid outdoor activity"
+
+
+def _humidity_analysis(h: float) -> str:
+    if h < 30: return "Very dry — stay hydrated"
+    if h < 50: return "Comfortable"
+    if h < 70: return "Moderate humidity"
+    if h < 85: return "High humidity — feels muggy"
+    return "Very high humidity — oppressive, heat stress risk"
+
+
+def _uv_analysis(uv: float) -> str:
+    if uv <= 2:  return f"{uv:.0f} — Low (safe for most)"
+    if uv <= 5:  return f"{uv:.0f} — Moderate (wear sunscreen after 30 min)"
+    if uv <= 7:  return f"{uv:.0f} — High (limit 10am-4pm exposure, SPF 30+)"
+    if uv <= 10: return f"{uv:.0f} — Very High (minimize sun exposure, SPF 50+)"
+    return f"{uv:.0f} — Extreme (avoid outdoor activity, full protection)"
+
+
+def _aqi_analysis(aqi: int, label: str) -> str:
+    tips = {
+        "Good":               "Air quality excellent — safe for all outdoor activities.",
+        "Satisfactory":       "Air quality satisfactory — sensitive groups take minor precautions.",
+        "Moderately Polluted":"Air quality moderate — children/elderly limit prolonged outdoor activity.",
+        "Poor":               "Air quality poor — everyone should reduce outdoor exertion.",
+        "Very Poor":          "Air quality very poor — avoid outdoor activity, wear N95 mask.",
+        "Severe":             "Air quality severe — stay indoors, seal windows, use air purifier.",
+    }
+    return tips.get(label, f"AQI {aqi} — {label}")
+
+
+def _rain_intensity(mm_h: float) -> str:
+    if mm_h == 0:   return "No rain"
+    if mm_h < 2.5:  return "Drizzle (light)"
+    if mm_h < 7.5:  return "Light rain"
+    if mm_h < 15:   return "Moderate rain"
+    if mm_h < 30:   return "Heavy rain — expect reduced visibility"
+    if mm_h < 60:   return "Very heavy rain — avoid travel"
+    return "Extreme rain — severe flooding risk, evacuate low areas"
+
+
+def _visibility_analysis(km: float) -> str:
+    if km >= 10: return f"{km} km — clear"
+    if km >= 5:  return f"{km} km — slightly reduced"
+    if km >= 2:  return f"{km} km — poor (drive slowly)"
+    return f"{km} km — very poor (fog/rain, use headlights)"
+
+
 def _build_weather_block(label: str, weather: dict, flood: dict | None = None) -> list[str]:
-    """Build a weather context block for a given location."""
     lines = []
     c      = weather.get("current", {})
     daily  = weather.get("daily",   [])
@@ -27,57 +79,76 @@ def _build_weather_block(label: str, weather: dict, flood: dict | None = None) -
     state   = c.get("state", "")
     loc_str = ", ".join(filter(None, [city, state, country]))
 
+    temp      = c.get("temp", 0)
+    humidity  = c.get("humidity", 0)
+    wind_spd  = c.get("wind_speed", 0)
+    uv        = c.get("uv_index", 0)
+    vis       = c.get("visibility", 10)
+    rain_1h   = c.get("rain_1h", 0)
+    pressure  = c.get("pressure", 1013)
+
+    aq    = c.get("air_quality", {})
+    aqi   = aq.get("aqi", 0)
+    aq_lb = aq.get("label", "Good")
+
     lines += [
         f"=== {label}: {loc_str} ===",
-        f"Temperature  : {c.get('temp')}°C  (feels like {c.get('feels_like')}°C)",
-        f"Today range  : {c.get('temp_min')}°C min — {c.get('temp_max')}°C max",
-        f"Sky          : {c.get('description', c.get('condition', 'N/A'))}",
-        f"Humidity     : {c.get('humidity')}%",
-        f"Wind         : {c.get('wind_speed')} km/h {c.get('wind_dir', '')}",
-        f"Pressure     : {c.get('pressure')} hPa",
-        f"UV Index     : {c.get('uv_label', c.get('uv_index', 'N/A'))}",
-        f"Visibility   : {c.get('visibility')} km",
-        f"Rainfall 1h  : {c.get('rain_1h', 0)} mm",
+        f"Temperature   : {temp}°C  (feels like {c.get('feels_like')}°C)",
+        f"Today range   : {c.get('temp_min')}°C min — {c.get('temp_max')}°C max",
+        f"Condition     : {c.get('description', c.get('condition', 'N/A'))}",
+        f"Humidity      : {humidity}%  → {_humidity_analysis(humidity)}",
+        f"Wind          : {wind_spd} km/h {c.get('wind_dir', '')}  → {_wind_analysis(wind_spd)}",
+        f"Rain (last 1h): {rain_1h} mm  → {_rain_intensity(rain_1h)}",
+        f"Pressure      : {pressure} hPa",
+        f"UV Index      : {_uv_analysis(uv)}",
+        f"Visibility    : {_visibility_analysis(vis)}",
+        f"Air Quality   : {aq_lb}  (NAQI {aqi})  → {_aqi_analysis(aqi, aq_lb)}",
     ]
-    aq = c.get("air_quality", {})
-    if aq:
-        lines.append(f"Air Quality  : {aq.get('label', 'N/A')}  (AQI {aq.get('aqi', 'N/A')})")
 
-    # Next 6 hours
+    # ── Next 6 hours ──────────────────────────────────────────────────────────
     if hourly:
         lines.append(f"\n--- Next 6 Hours ({city}) ---")
         for h in hourly[:6]:
+            rain_tag = f"  ⚠ Rain {h['rain_prob']}%" if h['rain_prob'] >= 40 else f"  Rain {h['rain_prob']}%"
             lines.append(
-                f"  {h['time']:>5}  {h['condition']:<22}  {h['temp']}°C  "
-                f"Rain {h['rain_prob']}%"
+                f"  {h['time']:>5}  {h['condition']:<22}  {h['temp']}°C{rain_tag}"
             )
 
-    # 7-day forecast with TODAY / TOMORROW labels
+    # ── 7-day forecast ────────────────────────────────────────────────────────
     if daily:
         lines.append(f"\n--- 7-Day Forecast ({city}) ---")
         for i, d in enumerate(daily[:7]):
             tag = ""
             if i == 0:   tag = " ← TODAY"
             elif i == 1: tag = " ← TOMORROW"
+            risk_flag = " ⚠ HIGH RAIN" if d['rain_prob'] >= 70 else ""
             lines.append(
-                f"  {d['day']}{tag:<12}  {d['condition']:<22}  "
-                f"{d['temp_min']}–{d['temp_max']}°C  Rain {d['rain_prob']}%"
+                f"  {d['day']}{tag:<12}  {d['condition']:<24}  "
+                f"{d['temp_min']}–{d['temp_max']}°C  Rain {d['rain_prob']}%{risk_flag}"
             )
 
-    # Flood prediction (only for user's own location)
+        # Weekly pattern summary
+        avg_rain = sum(d['rain_prob'] for d in daily[:7]) / max(len(daily[:7]), 1)
+        max_rain_day = max(daily[:7], key=lambda d: d['rain_prob'])
+        lines.append(
+            f"\n  Weekly pattern: avg rain probability {avg_rain:.0f}%  |  "
+            f"wettest day: {max_rain_day['day']} ({max_rain_day['rain_prob']}%)"
+        )
+
+    # ── Flood prediction ──────────────────────────────────────────────────────
     if flood:
         pct = round(flood["probability"] * 100)
+        soil_pct = round(flood["soil_moisture"] * 100)
         lines += [
             f"\n--- Flood Prediction ({city}) ---",
-            f"Flood risk level  : {flood['risk_level']}",
+            f"Risk level        : {flood['risk_level']}",
             f"Flood probability : {pct}%",
-            f"Flood likely      : {'YES' if flood['flood_likely'] else 'NO'}",
-            f"Rainfall 1h       : {flood['rainfall_1h']} mm/h",
-            f"Rainfall 24h      : {flood['rainfall_24h']} mm",
-            f"Soil moisture     : {round(flood['soil_moisture'] * 100)}% saturated",
-            f"Humidity          : {flood['humidity']}%",
-            f"Elevation         : {flood['elevation']} m above sea level",
-            f"Drainage score    : {flood['drainage']} / 10",
+            f"Flood imminent    : {'⚠ YES — EVACUATE LOW AREAS' if flood['flood_likely'] else 'No'}",
+            f"Rainfall (1h)     : {flood['rainfall_1h']} mm/h  → {_rain_intensity(flood['rainfall_1h'])}",
+            f"Rainfall (24h)    : {flood['rainfall_24h']} mm",
+            f"Soil saturation   : {soil_pct}%  {'← Near saturation, runoff risk high' if soil_pct > 70 else ''}",
+            f"Elevation         : {flood['elevation']} m  {'← Low-lying area, flood risk elevated' if flood['elevation'] < 50 else ''}",
+            f"Drainage score    : {flood['drainage']} / 10  {'← Poor drainage' if flood['drainage'] < 4 else ''}",
         ]
 
     return lines
@@ -90,17 +161,15 @@ def _build_weather_context(
 ) -> str:
     lines = []
 
-    # ── Requested city weather (highest priority — user asked about this) ─────
     if requested_weather:
         lines += _build_weather_block(
-            "LIVE WEATHER FOR REQUESTED CITY", requested_weather
+            "LIVE WEATHER — REQUESTED CITY", requested_weather
         )
         lines.append("")
 
-    # ── User's current GPS location weather ───────────────────────────────────
     if weather:
         lines += _build_weather_block(
-            "USER'S CURRENT LOCATION WEATHER", weather, flood
+            "LIVE WEATHER — USER'S CURRENT LOCATION", weather, flood
         )
     elif not requested_weather:
         lines.append("=== WEATHER === No live weather data available for this session.")
@@ -108,33 +177,61 @@ def _build_weather_context(
     return "\n".join(lines)
 
 
-_SYSTEM = """You are **JeevanSetu AI** — a highly accurate, real-time weather and flood-safety assistant built into a disaster-preparedness app used in India.
+_SYSTEM = """You are **JeevanSetu AI** — India's most accurate real-time weather, climate, and flood-safety assistant. You are embedded in a disaster-preparedness app.
 
-You have been given LIVE real-time weather data fetched right now. Use it to give precise, helpful answers.
+You have LIVE data fetched RIGHT NOW from global meteorological APIs (Open-Meteo, OpenWeather). Use it precisely.
 
 {weather_context}
 
 ---
 
-STRICT RULES:
-1. **ALWAYS use the live data above** to answer. NEVER say "I don't have weather data" — you always do.
-2. If the data shows **LIVE WEATHER FOR REQUESTED CITY**, the user asked about that city — answer using THAT data only.
-3. If there is no requested-city data but user asks about a city, say: "I fetched data for your current location. For [City], the weather couldn't be retrieved — please try asking again."
-4. For "Will it rain?" → give the EXACT rain probability % from the forecast for that day.
-5. For "Can I go out tomorrow?" or "Is it safe?" → check tomorrow's forecast rain %, temperature, flood risk → give YES/NO with specific numbers.
-6. For flood risk → use flood prediction data (probability %, risk level, soil moisture).
-7. Keep answers SHORT and direct: 2–4 sentences max. Use bullet points only for multi-day queries.
-8. **Bold** key values: temperatures, percentages, risk levels, day names.
-9. End with a short *italic safety tip* when relevant.
-10. Respond in the same language the user writes in (English, Kannada, or Hindi).
-11. If the question is completely unrelated to weather/safety/floods, politely decline.
-12. NEVER make up data. If a field is missing, skip it — don't invent numbers.
+## CORE DIRECTIVES
 
-ANSWER STYLE EXAMPLES:
-- "Mysore" or "Weather in Mysore" → "In **Mysore**, it's currently **[condition]**, **X°C** (feels like Y°C). Tomorrow: **[condition]**, **A–B°C**, rain chance **Z%**. *[Safety tip].*"
-- "Is it safe to go to Mysore?" → "In **Mysore** right now: **[condition]**, **X°C**, rain chance **Z%** tomorrow. [Yes/No, safe/risky because...]. *[Tip].*"
-- "Will it rain tomorrow?" → "**Tomorrow** in **[City]**: **[condition]**, rain probability **X%**, **Y–Z°C**. [Safe/bring umbrella advice]. *[Tip].*"
-- "What is the flood risk?" → "Current flood risk is **[level]** with **X%** probability. Soil is **Y%** saturated. [Advice]. *[Tip].*"
+1. **ALWAYS use the live data above.** Never say "I don't have weather data" — you always do.
+2. **Requested city takes priority.** If data shows "LIVE WEATHER — REQUESTED CITY", answer using THAT data, not the user's GPS location.
+3. **Be a climate analyst, not just a data reader.** Interpret the numbers: explain what they MEAN for safety, travel, outdoor activity.
+4. **Precise numbers.** Always quote actual figures from the data — temperature, rain %, humidity, AQI.
+5. **Short and direct.** 2–4 sentences max for simple questions. Use bullet points only for multi-day or complex queries.
+6. **Bold** key values: temperatures, percentages, risk levels, day names.
+7. End with a *italic safety tip* when relevant.
+8. Match the user's language (English, Kannada, Hindi).
+9. Decline questions unrelated to weather / safety / climate / floods.
+10. NEVER invent data. If a value is missing, skip it.
+
+---
+
+## ANSWER TEMPLATES
+
+**City weather query** ("Mysore", "weather in Bangalore"):
+→ "In **[City]**, it's currently **[condition]**, **X°C** (feels like Y°C). Humidity **H%**, wind **W km/h**. This week: [brief pattern]. *[Safety/outdoor tip].*"
+
+**Travel safety** ("safe to go to Mysore", "can I travel to Chennai?"):
+→ "**[City]** weather today: **[condition]**, **X°C**, rain chance **Z%**. [Safe/caution/avoid] because [specific reason with numbers]. *[Tip].*"
+
+**Rain query** ("will it rain?", "rain this weekend?"):
+→ "**[Day]** in **[City]**: **[condition]**, **X%** rain probability, **Y–Z°C**. [Risk level advice]. *[Tip].*"
+
+**Climate/analysis query** ("how is the climate in Mysore?", "analyze weather"):
+→ Give a structured 4–5 point analysis: current conditions, weekly forecast pattern, humidity/heat stress, air quality, flood risk if applicable.
+
+**Flood risk** ("flood risk?", "is flooding likely?"):
+→ "Flood risk is **[level]** (**X%** probability). Soil **Y%** saturated, rainfall **Z mm/h**. [Safe/evacuate/caution]. *[Tip].*"
+
+**Comparison** ("is Mysore better than Bangalore for travel?"):
+→ Compare both cities side by side with actual data. Give a clear recommendation.
+
+---
+
+## CLIMATE ANALYSIS FORMAT (for "analyze", "climate", "tell me about" queries)
+
+Use this structure:
+🌡️ **Temperature**: [current + today range]
+💧 **Humidity**: [value + comfort level]
+🌧️ **Rainfall outlook**: [weekly pattern + wettest day]
+💨 **Wind & Visibility**: [conditions]
+🌿 **Air Quality**: [AQI + label + advice]
+🏞️ **Flood Risk**: [level + probability]
+✅ **Verdict**: [1 sentence overall assessment]
 """
 
 
@@ -176,8 +273,8 @@ def get_ai_response(
             json={
                 "model":       _GROQ_MODEL,
                 "messages":    msgs,
-                "max_tokens":  500,
-                "temperature": 0.3,   # lower = more factual, less hallucination
+                "max_tokens":  600,
+                "temperature": 0.3,
             },
             timeout=30,
         )
@@ -199,16 +296,18 @@ def get_ai_response(
 
 def _suggestions(user_msg: str, resp: str = "") -> list[str]:
     m = (user_msg + resp).lower()
-    if any(w in m for w in ["tomorrow", "go out", "travel", "safe to"]):
+    if any(w in m for w in ["tomorrow", "go out", "travel", "safe to", "can i"]):
         return ["What about the weekend?", "Flood risk in my area?", "Best time to go out today?"]
     if any(w in m for w in ["rain", "drizzle", "shower"]):
         return ["How long will the rain last?", "Is it safe to drive?", "Best time to go outside?"]
     if any(w in m for w in ["flood", "water", "inundation", "risk"]):
         return ["Nearest emergency shelter?", "What to pack for evacuation?", "Will it rain today?"]
-    if any(w in m for w in ["heat", "hot", "sunny"]):
+    if any(w in m for w in ["heat", "hot", "sunny", "uv"]):
         return ["How to stay safe in heat?", "UV index forecast?", "Best outdoor time today?"]
     if any(w in m for w in ["wind", "storm", "cyclone", "thunder"]):
         return ["Is it safe to go out?", "Storm duration forecast?", "Emergency contacts?"]
-    if any(w in m for w in ["mysore", "bangalore", "chennai", "mumbai", "delhi", "hyderabad"]):
-        return ["Will it rain there tomorrow?", "Flood risk in that area?", "Is it safe to travel there?"]
+    if any(w in m for w in ["air", "aqi", "quality", "pollution", "smog"]):
+        return ["Is it safe to exercise outside?", "Best time for outdoor activity?", "Flood risk in my area?"]
+    if any(w in m for w in ["climate", "analyze", "analysis", "mysore", "bangalore", "chennai", "mumbai", "delhi", "hyderabad", "kolkata", "pune"]):
+        return ["Will it rain there tomorrow?", "Is it safe to travel there?", "Compare with my location"]
     return ["Will it rain tomorrow?", "Flood risk in my area?", "Is it safe to travel today?"]

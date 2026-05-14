@@ -1,7 +1,9 @@
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel
 import requests as _req
 import re
+from datetime import datetime, timezone, timedelta
+
 from services.ai_service import get_ai_response
 from services.weather_service import get_full_weather, geocode_city
 from config import GROQ_API_KEY
@@ -34,12 +36,104 @@ _NON_CITY_WORDS = {
     "groq", "ai", "app", "data", "forecast", "chance", "probability",
 }
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+def _db():
+    from services.supabase_service import _get_service_client
+    return _get_service_client()
+
+
+def _save_messages(phone: str, user_text: str, ai_text: str) -> None:
+    """Persist one user + one assistant message to chat_messages table."""
+    if not phone:
+        return
+    try:
+        db = _db()
+        if not db:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        db.table("chat_messages").insert([
+            {"phone": phone, "role": "user",      "content": user_text, "created_at": now},
+            {"phone": phone, "role": "assistant",  "content": ai_text,  "created_at": now},
+        ]).execute()
+    except Exception as e:
+        print(f"[CHAT] DB save error: {e}")
+
+
+def _load_today_history(phone: str) -> list[dict]:
+    """Return today's messages (IST midnight → now) for a user, oldest first."""
+    if not phone:
+        return []
+    try:
+        db = _db()
+        if not db:
+            return []
+        # Today's start in IST → convert to UTC for the query
+        now_ist = datetime.now(IST)
+        today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_utc = today_start_ist.astimezone(timezone.utc).isoformat()
+
+        res = (
+            db.table("chat_messages")
+            .select("role, content, created_at")
+            .eq("phone", phone)
+            .gte("created_at", today_start_utc)
+            .order("created_at", desc=False)
+            .limit(200)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        print(f"[CHAT] DB load error: {e}")
+        return []
+
+
+def _clear_all_messages(phone: str) -> int:
+    """Delete ALL chat_messages rows for a phone. Returns deleted count."""
+    try:
+        db = _db()
+        if not db:
+            return 0
+        res = db.table("chat_messages").delete().eq("phone", phone).execute()
+        return len(res.data or [])
+    except Exception as e:
+        print(f"[CHAT] DB clear error: {e}")
+        return 0
+
+
+def _clear_old_messages() -> int:
+    """
+    Delete messages from previous IST days.
+    Called by the daily midnight scheduler loop.
+    """
+    try:
+        db = _db()
+        if not db:
+            return 0
+        now_ist = datetime.now(IST)
+        today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_utc = today_start_ist.astimezone(timezone.utc).isoformat()
+
+        res = (
+            db.table("chat_messages")
+            .delete()
+            .lt("created_at", today_start_utc)
+            .execute()
+        )
+        count = len(res.data or [])
+        print(f"[ChatCleanup] Deleted {count} old messages (before {today_start_utc})")
+        return count
+    except Exception as e:
+        print(f"[ChatCleanup] Error: {e}")
+        return 0
+
+
+# ── City detection ─────────────────────────────────────────────────────────────
 
 def _extract_city_candidates(message: str) -> list[str]:
-    """
-    Extract potential city names from a user message.
-    Returns a prioritized list of candidates to try geocoding.
-    """
     candidates = []
 
     # Pattern 1: after prepositions — "weather in Mysore", "travel to Bangalore"
@@ -52,14 +146,14 @@ def _extract_city_candidates(message: str) -> list[str]:
         if c.lower() not in _NON_CITY_WORDS and len(c) > 2:
             candidates.append(c)
 
-    # Pattern 2: full message is just a city name (like user typed "Mysore")
+    # Pattern 2: entire message is a city name
     stripped = message.strip().rstrip("?.,!")
     if 2 < len(stripped) < 30 and re.match(r'^[A-Za-z][a-zA-Z\s]+$', stripped):
         c = stripped.title()
         if c.lower() not in _NON_CITY_WORDS:
-            candidates.insert(0, c)  # highest priority
+            candidates.insert(0, c)
 
-    # Pattern 3: capitalized words that look like proper nouns
+    # Pattern 3: capitalized proper nouns
     cap_matches = re.findall(r'\b([A-Z][a-z]{2,15}(?:\s+[A-Z][a-z]{2,15})?)\b', message)
     for m in cap_matches:
         c = m.strip()
@@ -70,27 +164,24 @@ def _extract_city_candidates(message: str) -> list[str]:
 
 
 def _get_city_weather(message: str) -> dict | None:
-    """
-    Try to extract a city name from the message, geocode it, and fetch its weather.
-    Returns weather dict or None if no city found / geocoding failed.
-    """
     candidates = _extract_city_candidates(message)
     for city in candidates:
-        print(f"[CHAT] Trying to geocode city candidate: '{city}'")
+        print(f"[CHAT] Trying to geocode: '{city}'")
         geo = geocode_city(city)
         if geo:
-            print(f"[CHAT] Geocoded '{city}' → {geo['city']}, {geo['country']} ({geo['lat']}, {geo['lon']})")
+            print(f"[CHAT] Geocoded '{city}' → {geo['city']}, {geo['country']}")
             try:
                 weather = get_full_weather(geo["lat"], geo["lon"])
-                # Override city name with the geocoded canonical name
-                weather["current"]["city"] = geo["city"]
+                weather["current"]["city"]    = geo["city"]
                 weather["current"]["country"] = geo["country"]
-                weather["current"]["state"] = geo.get("state", "")
+                weather["current"]["state"]   = geo.get("state", "")
                 return weather
             except Exception as e:
-                print(f"[CHAT] Weather fetch failed for geocoded city '{city}': {e}")
+                print(f"[CHAT] Weather fetch failed for '{city}': {e}")
     return None
 
+
+# ── Request/Response models ────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
     role: str
@@ -102,22 +193,25 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = []
     lat: float | None = None
     lon: float | None = None
+    phone: str | None = None   # user's phone — used to persist + retrieve history
 
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("")
 def chat(req: ChatRequest):
     try:
-        weather_data       = None   # user's GPS location weather
-        flood_data         = None   # flood prediction for user's location
-        requested_weather  = None   # weather for a city the user asked about
+        weather_data      = None
+        flood_data        = None
+        requested_weather = None
 
-        # ── Fetch weather for any city mentioned in the message ──────────────
+        # ── City mentioned in message → fetch its weather ────────────────────
         try:
             requested_weather = _get_city_weather(req.message)
         except Exception as e:
             print(f"[CHAT] City weather extraction failed: {e}")
 
-        # ── Fetch real-time weather + flood for user's GPS location ──────────
+        # ── GPS location weather + flood prediction ──────────────────────────
         if req.lat is not None and req.lon is not None:
             try:
                 weather_data = get_full_weather(req.lat, req.lon)
@@ -154,21 +248,51 @@ def chat(req: ChatRequest):
             except Exception as e:
                 print(f"[CHAT] Flood prediction fetch failed: {e}")
 
-        history = [{"role": m.role, "content": m.content} for m in req.history]
-        return get_ai_response(
+        # ── Load DB history for today if phone provided ──────────────────────
+        if req.phone and not req.history:
+            db_rows = _load_today_history(req.phone)
+            history = [{"role": r["role"], "content": r["content"]} for r in db_rows]
+        else:
+            history = [{"role": m.role, "content": m.content} for m in req.history]
+
+        # ── Get AI response ──────────────────────────────────────────────────
+        result = get_ai_response(
             req.message, history, weather_data, flood_data,
             requested_weather=requested_weather
         )
+
+        # ── Persist to DB ────────────────────────────────────────────────────
+        if req.phone:
+            _save_messages(req.phone, req.message, result.get("response", ""))
+
+        return result
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/history")
+def get_history(phone: str = Query(..., description="User phone number")):
+    """Return today's chat messages for a user (oldest first)."""
+    rows = _load_today_history(phone)
+    return {
+        "phone":    phone,
+        "date":     datetime.now(IST).strftime("%Y-%m-%d"),
+        "messages": [{"role": r["role"], "content": r["content"], "time": r["created_at"]} for r in rows],
+        "count":    len(rows),
+    }
+
+
+@router.delete("/history")
+def clear_history(phone: str = Query(..., description="User phone number")):
+    """Manually clear all chat messages for a user."""
+    count = _clear_all_messages(phone)
+    return {"success": True, "deleted": count, "message": "Chat history cleared"}
+
+
 @router.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
-    """
-    Transcribe voice audio using Groq Whisper (whisper-large-v3-turbo).
-    """
+    """Transcribe voice audio using Groq Whisper (whisper-large-v3-turbo)."""
     if not GROQ_API_KEY:
         raise HTTPException(status_code=503, detail="Groq API key not configured")
 

@@ -454,16 +454,47 @@ async def weather_tip_loop() -> None:
         await asyncio.sleep(WEATHER_TIP_SECS)
 
 
+# ── LOOP 3 — Daily chat cleanup at midnight IST ───────────────────────────────
+
+from datetime import timezone, timedelta as _td
+_IST = timezone(_td(hours=5, minutes=30))
+
+async def chat_cleanup_loop() -> None:
+    """
+    Runs every hour. At the first tick past midnight IST, wipes all chat
+    messages from previous IST days so every user starts fresh each day.
+    """
+    logger.info("[ChatCleanup] Loop started — checking every hour")
+    _last_cleanup_date: list[str] = [""]   # mutable container for closure
+
+    while True:
+        try:
+            now_ist = datetime.now(_IST)
+            today_str = now_ist.strftime("%Y-%m-%d")
+
+            if today_str != _last_cleanup_date[0]:
+                # New IST day — clear old messages
+                from routes.chat import _clear_old_messages
+                count = await asyncio.to_thread(_clear_old_messages)
+                _last_cleanup_date[0] = today_str
+                logger.info(f"[ChatCleanup] ✅ Cleared {count} old messages for {today_str}")
+        except Exception as e:
+            logger.error(f"[ChatCleanup] Error: {e}")
+
+        await asyncio.sleep(3600)   # check every hour
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def run_scheduler() -> None:
     """
-    Start both loops concurrently.
+    Start all three loops concurrently.
     Called from main.py lifespan — runs for the entire server lifetime.
     """
     logging.basicConfig(level=logging.INFO)
-    logger.info("[Scheduler] Starting both loops...")
+    logger.info("[Scheduler] Starting all loops...")
     await asyncio.gather(
         flood_check_loop(),
         weather_tip_loop(),
+        chat_cleanup_loop(),
     )

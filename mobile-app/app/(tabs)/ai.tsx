@@ -11,7 +11,8 @@ import Header from '@/components/Header';
 import { Feather, Ionicons } from '@expo/vector-icons';
 
 import useLocation from '@/hooks/useLocation';
-import { sendChatMessage, transcribeAudio } from '@/services/api';
+import { useAuth } from '@/context/AuthContext';
+import { sendChatMessage, transcribeAudio, fetchChatHistory, clearChatHistory } from '@/services/api';
 
 // Conditionally import expo-av only on native
 let Audio: any = null;
@@ -254,11 +255,13 @@ export default function AIScreen() {
   const theme        = Colors[colorScheme];
   const isDark       = colorScheme === 'dark';
   const { location } = useLocation();
+  const { user }     = useAuth();
 
   const [messages, setMessages]         = useState<Message[]>([]);
   const [suggestions, setSuggestions]   = useState(INITIAL_SUGGESTIONS.map(s => s.text));
   const [input, setInput]               = useState('');
   const [isLoading, setIsLoading]       = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [voiceOpen, setVoiceOpen]       = useState(false);
   const [isRecording, setIsRecording]   = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -266,6 +269,50 @@ export default function AIScreen() {
   const recordingRef = useRef<any>(null);
   const scrollRef    = useRef<ScrollView>(null);
   const now = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // ── Load today's chat history from server on mount ───────────────────────
+  useEffect(() => {
+    if (!user?.phone) return;
+    setIsLoadingHistory(true);
+    fetchChatHistory(user.phone)
+      .then(data => {
+        if (data.messages && data.messages.length > 0) {
+          const loaded: Message[] = data.messages.map((m, i) => ({
+            id:           `hist_${i}_${Date.now()}`,
+            role:         m.role as 'user' | 'assistant',
+            text:         m.content,
+            time:         new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            showFeedback: m.role === 'assistant',
+          }));
+          setMessages(loaded);
+          setTimeout(() => scrollRef.current?.scrollToEnd({ animated: false }), 200);
+        }
+      })
+      .catch(() => { /* silently ignore — offline or first time */ })
+      .finally(() => setIsLoadingHistory(false));
+  }, [user?.phone]);
+
+  // ── Clear chat handler ───────────────────────────────────────────────────
+  const handleClearChat = useCallback(() => {
+    Alert.alert(
+      'Clear Chat',
+      'Clear all messages from today? This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: async () => {
+            setMessages([]);
+            setSuggestions(INITIAL_SUGGESTIONS.map(s => s.text));
+            if (user?.phone) {
+              try { await clearChatHistory(user.phone); } catch {}
+            }
+          },
+        },
+      ],
+    );
+  }, [user?.phone]);
 
   const send = useCallback(async (text: string) => {
     const trimmed = text.trim();
@@ -276,10 +323,8 @@ export default function AIScreen() {
     setIsLoading(true);
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
     try {
-      const history = messages.slice(-10).map(m => ({
-        role: m.role === 'user' ? 'user' : 'assistant', content: m.text,
-      }));
-      const result = await sendChatMessage(trimmed, history, location?.lat, location?.lon);
+      // Pass empty history — server loads from DB keyed by phone
+      const result = await sendChatMessage(trimmed, [], location?.lat, location?.lon, user?.phone);
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(), role: 'assistant',
         text: result.response, time: now(), showFeedback: true,
@@ -382,22 +427,44 @@ export default function AIScreen() {
               style={styles.heroGradient}
               start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
             >
+              {/* Clear chat button (top right) */}
+              {messages.length > 0 && (
+                <TouchableOpacity
+                  style={styles.clearBtn}
+                  onPress={handleClearChat}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="trash-outline" size={16} color="rgba(255,255,255,0.75)" />
+                  <Text style={styles.clearBtnText}>Clear</Text>
+                </TouchableOpacity>
+              )}
+
               <View style={styles.heroIconBg}>
                 <Ionicons name="hardware-chip-outline" size={36} color="#fff" />
               </View>
               <Text style={styles.heroTitle}>JeevanSetu AI</Text>
               <Text style={styles.heroSubtitle}>
-                Your intelligent weather &amp; flood-safety assistant. Ask me anything.
+                Real-time weather intelligence &amp; flood-safety assistant.
               </Text>
 
               {/* Capability chips */}
               <View style={styles.heroChips}>
-                {['Weather Forecasts', 'Flood Risk', 'Safety Tips'].map((c, i) => (
+                {['Live Weather', 'Climate Analysis', 'Flood Risk', 'Any City'].map((c, i) => (
                   <View key={i} style={styles.heroChip}>
                     <Text style={styles.heroChipText}>{c}</Text>
                   </View>
                 ))}
               </View>
+
+              {/* History loading indicator */}
+              {isLoadingHistory && (
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, gap: 6 }}>
+                  <ActivityIndicator size="small" color="rgba(255,255,255,0.6)" />
+                  <Text style={{ color: 'rgba(255,255,255,0.6)', fontSize: 11, fontFamily: 'PlusJakartaSans_400Regular' }}>
+                    Loading today's chat…
+                  </Text>
+                </View>
+              )}
             </LinearGradient>
           </View>
 
@@ -566,6 +633,17 @@ const styles = StyleSheet.create({
   heroGradient: {
     borderRadius: 24, padding: 24, alignItems: 'center',
     overflow: 'hidden',
+  },
+  clearBtn: {
+    position: 'absolute', top: 14, right: 14,
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 20, paddingHorizontal: 10, paddingVertical: 5,
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)',
+  },
+  clearBtnText: {
+    fontFamily: 'PlusJakartaSans_500Medium',
+    fontSize: 11, color: 'rgba(255,255,255,0.75)',
   },
   heroIconBg: {
     width: 72, height: 72, borderRadius: 20,
