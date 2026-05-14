@@ -25,8 +25,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 # ── ML model feature list (must match train_cyclone.py CYCLONE_FEATURES) ──────
-# 10 features — cape_jkg and tropical_instability removed (both 0 in ERA5 archive,
-# Cohen's d = 0.00, zero predictive value for training data)
+# 11 features — temperature_2m added as warm-ocean proxy (v4)
+# cape_jkg and tropical_instability still excluded (ERA5 always returns 0)
 CYCLONE_FEATURES = [
     "wind_gusts_kmh",
     "surface_pressure_hpa",
@@ -34,6 +34,7 @@ CYCLONE_FEATURES = [
     "pressure_anomaly_hpa",    # 1013.5 - surface_pressure
     "precipitation_mm",
     "humidity",
+    "temperature_2m",          # surface air temp as SST proxy (cyclone threshold 26 C)
     "wind_intensity_index",    # gusts * pressure_anomaly / 2000
     "coastal_proximity_km",
     "season_factor",
@@ -202,6 +203,7 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
                 "cape",
                 "precipitation",
                 "relative_humidity_2m",
+                "temperature_2m",
                 "weather_code",
             ],
             "hourly": [
@@ -234,6 +236,7 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
     cape        = float(cur.get("cape",                 0)    or 0)
     precip      = float(cur.get("precipitation",        0)    or 0)
     humidity    = float(cur.get("relative_humidity_2m", 70)   or 70)
+    temperature = float(cur.get("temperature_2m",       28)   or 28)
 
     # Pressure trend: compare current vs 6 hours ago
     h_pressure      = hourly.get("surface_pressure", [])
@@ -278,6 +281,7 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
         "cape_jkg":              round(cape,         1),
         "precipitation_mm":      round(precip,       2),
         "humidity":              round(humidity,     1),
+        "temperature_2m":        round(temperature,  1),
         "tropical_instability":  tropical_instability,
         "wind_intensity_index":  wind_intensity_index,
         "wind_shear_kmh":        wind_shear_kmh,    # display only (not ML feature)
@@ -318,6 +322,7 @@ def compute_probability(f: dict) -> float:
                 "pressure_anomaly_hpa":  f.get("pressure_anomaly_hpa", 1013.5 - f["surface_pressure_hpa"]),
                 "precipitation_mm":      f.get("precipitation_mm", 0.0),
                 "humidity":              f.get("humidity", 70.0),
+                "temperature_2m":        f.get("temperature_2m", 28.0),
                 "wind_intensity_index":  f.get("wind_intensity_index",
                                                f["wind_gusts_kmh"] * max(1013.5 - f["surface_pressure_hpa"], 0) / 2000),
                 "coastal_proximity_km":  f["coastal_proximity_km"],
