@@ -191,6 +191,14 @@ function CyclonePredictionCard({ data }: { data: CyclonePrediction }) {
               : 'Inland'}
           </Text>
         </View>
+        {f.wind_shear_kmh > 0 && (
+          <View style={fpStyles.signal}>
+            <Ionicons name="layers-outline" size={14} color={c.text} />
+            <Text style={[fpStyles.signalText, { color: c.text }]}>
+              Shear {f.wind_shear_kmh.toFixed(0)} km/h
+            </Text>
+          </View>
+        )}
       </View>
 
       {/* Top advice tips */}

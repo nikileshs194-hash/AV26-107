@@ -25,13 +25,16 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 # ── ML model feature list (must match train_cyclone.py CYCLONE_FEATURES) ──────
+# 10 features — cape_jkg and tropical_instability removed (both 0 in ERA5 archive,
+# Cohen's d = 0.00, zero predictive value for training data)
 CYCLONE_FEATURES = [
     "wind_gusts_kmh",
     "surface_pressure_hpa",
     "pressure_drop_6h",
-    "cape_jkg",
+    "pressure_anomaly_hpa",    # 1013.5 - surface_pressure
     "precipitation_mm",
     "humidity",
+    "wind_intensity_index",    # gusts * pressure_anomaly / 2000
     "coastal_proximity_km",
     "season_factor",
     "lat_abs",
@@ -190,8 +193,8 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
     resp = requests.get(
         _OPEN_METEO,
         params={
-            "latitude":       lat,
-            "longitude":      lon,
+            "latitude":        lat,
+            "longitude":       lon,
             "current": [
                 "wind_speed_10m",
                 "wind_gusts_10m",
@@ -205,10 +208,16 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
                 "surface_pressure",
                 "wind_speed_10m",
                 "wind_gusts_10m",
+                # Pressure-level wind for vertical wind shear (200-850 hPa)
+                # Gray (1979): high shear (>60 km/h) inhibits cyclone organization
+                "wind_speed_850hPa",
+                "wind_speed_200hPa",
+                # Mid-level humidity: dry air intrusion at 500 hPa kills cyclones
+                "relative_humidity_500hPa",
             ],
-            "past_hours":     6,
-            "forecast_hours": 1,
-            "timezone":       "auto",
+            "past_hours":      6,
+            "forecast_hours":  1,
+            "timezone":        "auto",
             "wind_speed_unit": "kmh",
         },
         timeout=15,
@@ -219,24 +228,45 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
     cur    = d.get("current", {})
     hourly = d.get("hourly", {})
 
-    wind_speed  = float(cur.get("wind_speed_10m",      0)    or 0)
-    wind_gusts  = float(cur.get("wind_gusts_10m",      0)    or 0)
-    pressure    = float(cur.get("surface_pressure",    1013) or 1013)
-    cape        = float(cur.get("cape",                0)    or 0)
-    precip      = float(cur.get("precipitation",       0)    or 0)
-    humidity    = float(cur.get("relative_humidity_2m", 70)  or 70)
+    wind_speed  = float(cur.get("wind_speed_10m",       0)    or 0)
+    wind_gusts  = float(cur.get("wind_gusts_10m",       0)    or 0)
+    pressure    = float(cur.get("surface_pressure",     1013) or 1013)
+    cape        = float(cur.get("cape",                 0)    or 0)
+    precip      = float(cur.get("precipitation",        0)    or 0)
+    humidity    = float(cur.get("relative_humidity_2m", 70)   or 70)
 
-    # Pressure trend: compare current pressure vs 6 hours ago
-    h_pressure  = hourly.get("surface_pressure", [])
+    # Pressure trend: compare current vs 6 hours ago
+    h_pressure      = hourly.get("surface_pressure", [])
     pressure_6h_ago = float(h_pressure[0]) if h_pressure and h_pressure[0] is not None else pressure
-    # positive value means pressure has been dropping (cyclone deepening)
     pressure_drop_6h = round(pressure_6h_ago - pressure, 2)
+
+    # ── Engineered features (must match train_cyclone.py) ─────────────────────
+    pressure_anomaly_hpa = round(1013.5 - pressure, 2)
+    tropical_instability = round(cape * (humidity / 100) / 500, 4)
+    wind_intensity_index = round(wind_gusts * max(pressure_anomaly_hpa, 0) / 2000, 5)
+
+    # ── Vertical wind shear (200-850 hPa) — real-time science modifier ────────
+    # Only available from forecast API (not ERA5), so used as physics modifier
+    # not as an ML model feature
+    w850_list = [v for v in hourly.get("wind_speed_850hPa", []) if v is not None]
+    w200_list = [v for v in hourly.get("wind_speed_200hPa", []) if v is not None]
+    if w850_list and w200_list:
+        n = min(len(w850_list), len(w200_list))
+        shear_vals = [abs(float(w200_list[i]) - float(w850_list[i])) for i in range(n)]
+        wind_shear_kmh = round(sum(shear_vals) / len(shear_vals), 1)
+    else:
+        wind_shear_kmh = 0.0
+
+    # Mid-level humidity at 500 hPa (dry air intrusion indicator)
+    h500_list = [v for v in hourly.get("relative_humidity_500hPa", []) if v is not None]
+    humidity_500hpa = round(sum(float(v) for v in h500_list) / max(len(h500_list), 1), 1) \
+                      if h500_list else 50.0
 
     coast_km = round(_coast_distance_km(lat, lon), 1)
     month    = datetime.now(timezone.utc).month
     s_factor = _season_factor(month)
 
-    gdacs    = _check_gdacs(lat, lon)
+    gdacs = _check_gdacs(lat, lon)
 
     return {
         "wind_speed_kmh":        round(wind_speed,  1),
@@ -244,9 +274,14 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
         "surface_pressure_hpa":  round(pressure,    1),
         "pressure_6h_ago_hpa":   round(pressure_6h_ago, 1),
         "pressure_drop_6h":      pressure_drop_6h,
+        "pressure_anomaly_hpa":  pressure_anomaly_hpa,
         "cape_jkg":              round(cape,         1),
         "precipitation_mm":      round(precip,       2),
         "humidity":              round(humidity,     1),
+        "tropical_instability":  tropical_instability,
+        "wind_intensity_index":  wind_intensity_index,
+        "wind_shear_kmh":        wind_shear_kmh,    # display only (not ML feature)
+        "humidity_500hpa":       humidity_500hpa,   # display only (not ML feature)
         "coastal_proximity_km":  coast_km,
         "season_factor":         s_factor,
         "lat_abs":               round(abs(lat),     2),
@@ -261,9 +296,15 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
 
 def compute_probability(f: dict) -> float:
     """
-    Hybrid probability: ML model (if available) blended with IMD physics score.
-    ML gets 70% weight when available; physics-only otherwise.
-    GDACS floor applied: if active TC within 1500 km → prob ≥ 0.60.
+    Hybrid probability: ML model (if available) + physics + real-time wind shear.
+
+    Step 1: ML model (trained on 55 real cyclone events) = 70% weight
+    Step 2: Physics (IMD thresholds) = 30% weight
+    Step 3: Wind shear inhibition (Gray 1979) — real-time atmospheric dynamics:
+              >80 km/h shear → cyclone highly unlikely (−40% inhibition)
+              60-80 km/h    → moderate inhibition (−20%)
+              <20 km/h      → favorable (+10% boost)
+    Step 4: GDACS floor — confirmed TC within 1500 km → prob >= 0.60
     """
     # ── ML model probability ──────────────────────────────────────────────────
     ml_prob = None
@@ -274,9 +315,11 @@ def compute_probability(f: dict) -> float:
                 "wind_gusts_kmh":        f["wind_gusts_kmh"],
                 "surface_pressure_hpa":  f["surface_pressure_hpa"],
                 "pressure_drop_6h":      f["pressure_drop_6h"],
-                "cape_jkg":              f["cape_jkg"],
-                "precipitation_mm":      f.get("precipitation_mm", f.get("precipitation_mm", 0.0)),
+                "pressure_anomaly_hpa":  f.get("pressure_anomaly_hpa", 1013.5 - f["surface_pressure_hpa"]),
+                "precipitation_mm":      f.get("precipitation_mm", 0.0),
                 "humidity":              f.get("humidity", 70.0),
+                "wind_intensity_index":  f.get("wind_intensity_index",
+                                               f["wind_gusts_kmh"] * max(1013.5 - f["surface_pressure_hpa"], 0) / 2000),
                 "coastal_proximity_km":  f["coastal_proximity_km"],
                 "season_factor":         f["season_factor"],
                 "lat_abs":               abs(f.get("lat_abs", 0.0)),
@@ -286,11 +329,10 @@ def compute_probability(f: dict) -> float:
         except Exception as _e:
             print(f"[CycloneService] ML inference failed: {_e}")
 
-    # ── Physics-based scoring (IMD thresholds) ────────────────────────────────
+    # ── Physics-based scoring (IMD thresholds, fallback) ──────────────────────
     wind_score     = min(f["wind_gusts_kmh"] / 222.0, 1.0)
     pressure_score = max(0.0, min((1013.0 - f["surface_pressure_hpa"]) / 73.0, 1.0))
-    drop           = max(f["pressure_drop_6h"], 0.0)
-    drop_score     = min(drop / 10.0, 1.0)
+    drop_score     = min(max(f["pressure_drop_6h"], 0.0) / 10.0, 1.0)
     cape_score     = min(f["cape_jkg"] / 3000.0, 1.0)
 
     physics_prob = (
@@ -302,13 +344,24 @@ def compute_probability(f: dict) -> float:
     physics_prob *= f["season_factor"]
     physics_prob *= _coast_factor(f["coastal_proximity_km"])
 
-    # ── Blend ─────────────────────────────────────────────────────────────────
-    if ml_prob is not None:
-        base = ml_prob * 0.70 + physics_prob * 0.30
-    else:
-        base = physics_prob
+    # ── Blend ML + physics ────────────────────────────────────────────────────
+    base = (ml_prob * 0.70 + physics_prob * 0.30) if ml_prob is not None else physics_prob
 
-    # GDACS floor: confirmed active cyclone nearby → at least High
+    # ── Wind shear inhibition/boost (Gray 1979) ───────────────────────────────
+    # Vertical wind shear between 200 and 850 hPa: the key atmospheric inhibitor.
+    # High shear tilts the cyclone vortex, preventing warm-core organization.
+    wind_shear = f.get("wind_shear_kmh", 0.0)
+    if wind_shear > 80:
+        # >80 km/h: strongly hostile environment — large inhibition
+        base *= 0.60
+    elif wind_shear > 60:
+        # 60-80 km/h: moderate hostile shear
+        base *= 0.80
+    elif wind_shear < 20 and wind_shear > 0:
+        # <20 km/h: very low shear — favorable for cyclone organization
+        base = min(base * 1.10, 1.0)
+
+    # ── GDACS floor ───────────────────────────────────────────────────────────
     if f["gdacs_active"]:
         base = max(base, 0.60)
 
@@ -334,6 +387,16 @@ def cyclone_advice(prob: float, f: dict) -> list[str]:
         tips.append("Below-normal pressure detected — monitor for rapid deterioration.")
     if f["pressure_drop_6h"] >= 4:
         tips.append(f"Pressure dropped {f['pressure_drop_6h']} hPa in 6 hours — rapid cyclone deepening.")
+    # Wind shear guidance (Gray 1979 cyclone inhibition)
+    shear = f.get("wind_shear_kmh", 0.0)
+    if shear > 80:
+        tips.append(f"High vertical wind shear ({shear:.0f} km/h) — currently inhibiting cyclone organization.")
+    elif shear < 20 and shear > 0 and prob >= 0.40:
+        tips.append(f"Very low wind shear ({shear:.0f} km/h) — favorable for cyclone intensification.")
+    # Mid-level dry air
+    h500 = f.get("humidity_500hpa", 50.0)
+    if h500 < 30 and prob >= 0.40:
+        tips.append(f"Dry air at mid-levels ({h500:.0f}% at 500 hPa) — may suppress convection.")
     if f["coastal_proximity_km"] < 300:
         tips.append("You are in a coastal zone — highest vulnerability to storm surge and cyclonic landfall.")
     if prob >= 0.80:

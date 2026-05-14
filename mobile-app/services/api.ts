@@ -219,9 +219,14 @@ export interface CycloneFeatures {
   surface_pressure_hpa: number;
   pressure_6h_ago_hpa: number;
   pressure_drop_6h: number;
+  pressure_anomaly_hpa: number;
   cape_jkg: number;
   precipitation_mm: number;
   humidity: number;
+  tropical_instability: number;
+  wind_intensity_index: number;
+  wind_shear_kmh: number;        // vertical wind shear 200-850 hPa
+  humidity_500hpa: number;       // mid-level humidity (dry air detection)
   coastal_proximity_km: number;
   season_factor: number;
   lat_abs?: number;
