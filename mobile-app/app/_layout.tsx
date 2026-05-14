@@ -3,13 +3,14 @@ import { Platform } from 'react-native';
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
 import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import 'react-native-reanimated';
 import '@/tasks/locationTask';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { AuthProvider, useAuth } from '@/context/AuthContext';
-import SOSAlertModal,   { SOSAlertData }   from '@/components/SOSAlertModal';
-import FloodAlertModal, { FloodAlertData } from '@/components/FloodAlertModal';
+import SOSAlertModal,       { SOSAlertData }       from '@/components/SOSAlertModal';
+import FloodAlertModal,     { FloodAlertData }     from '@/components/FloodAlertModal';
+import CycloneAlertModal,   { CycloneAlertData }   from '@/components/CycloneAlertModal';
+import EarthquakeAlertModal,{ EarthquakeAlertData }from '@/components/EarthquakeAlertModal';
 import { savePushToken } from '@/services/api';
 
 // ── Push notification setup (native only) ────────────────────────────────────
@@ -56,8 +57,10 @@ function RootLayoutInner() {
   const { user }    = useAuth();
   const colorScheme = useColorScheme();
 
-  const [sosAlert,   setSosAlert]   = useState<SOSAlertData | null>(null);
-  const [floodAlert, setFloodAlert] = useState<FloodAlertData | null>(null);
+  const [sosAlert,       setSosAlert]       = useState<SOSAlertData | null>(null);
+  const [floodAlert,     setFloodAlert]     = useState<FloodAlertData | null>(null);
+  const [cycloneAlert,   setCycloneAlert]   = useState<CycloneAlertData | null>(null);
+  const [earthquakeAlert,setEarthquakeAlert]= useState<EarthquakeAlertData | null>(null);
 
   const notifListenerRef    = useRef<any>(null);
   const responseListenerRef = useRef<any>(null);
@@ -155,6 +158,10 @@ function RootLayoutInner() {
             setSosAlert(data as SOSAlertData);
           } else if (data.type === 'flood_alert') {
             setFloodAlert(data as FloodAlertData);
+          } else if (data.type === 'cyclone_alert') {
+            setCycloneAlert(data as CycloneAlertData);
+          } else if (data.type === 'earthquake_alert') {
+            setEarthquakeAlert(data as EarthquakeAlertData);
           }
         }
       );
@@ -169,6 +176,10 @@ function RootLayoutInner() {
             setSosAlert(data as SOSAlertData);
           } else if (data.type === 'flood_alert') {
             setFloodAlert(data as FloodAlertData);
+          } else if (data.type === 'cyclone_alert') {
+            setCycloneAlert(data as CycloneAlertData);
+          } else if (data.type === 'earthquake_alert') {
+            setEarthquakeAlert(data as EarthquakeAlertData);
           }
         }
       );
@@ -202,6 +213,20 @@ function RootLayoutInner() {
         visible={!!floodAlert}
         data={floodAlert}
         onDismiss={() => setFloodAlert(null)}
+      />
+
+      {/* ── Global Cyclone Alert Modal ── */}
+      <CycloneAlertModal
+        visible={!!cycloneAlert}
+        data={cycloneAlert}
+        onDismiss={() => setCycloneAlert(null)}
+      />
+
+      {/* ── Global Earthquake Alert Modal ── */}
+      <EarthquakeAlertModal
+        visible={!!earthquakeAlert}
+        data={earthquakeAlert}
+        onDismiss={() => setEarthquakeAlert(null)}
       />
     </ThemeProvider>
   );

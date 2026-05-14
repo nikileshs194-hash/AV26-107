@@ -52,7 +52,6 @@
     },
     "plugins": [
       "expo-router",
-      "expo-dev-client",
       [
         "expo-splash-screen",
         {
@@ -90,6 +89,10 @@
         }
       ]
     ],
+    "updates": {
+      "enabled": false,
+      "checkAutomatically": "NEVER"
+    },
     "experiments": {
       "typedRoutes": true
     },

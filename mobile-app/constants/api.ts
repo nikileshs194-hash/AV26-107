@@ -6,6 +6,6 @@ import { Platform } from 'react-native';
 const BACKEND_URL =
   Platform.OS === 'web'
     ? 'http://localhost:8000'
-    : 'http://10.87.30.1:8000';
+    : 'http://10.92.249.1:8000';
 
 export default BACKEND_URL;

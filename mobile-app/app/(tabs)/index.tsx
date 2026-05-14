@@ -12,9 +12,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import useLocation from '@/hooks/useLocation';
 import { useAuth } from '@/context/AuthContext';
 import {
-  fetchWeather, fetchFloodPrediction, fetchCyclonePrediction,
+  fetchWeather, fetchFloodPrediction, fetchCyclonePrediction, fetchEarthquakePrediction,
   sendSOS, notifyNearby, findNearest,
-  FloodPrediction, WeatherResponse, CyclonePrediction,
+  FloodPrediction, WeatherResponse, CyclonePrediction, EarthquakePrediction,
 } from '@/services/api';
 
 // ─── Flood Prediction Card ────────────────────────────────────────────────────
@@ -236,6 +236,135 @@ function CyclonePredictionCard({ data }: { data: CyclonePrediction }) {
   );
 }
 
+// ─── Earthquake Prediction Card ──────────────────────────────────────────────
+
+const EQ_COLORS: Record<string, { bg: string; border: string; text: string; badge: string }> = {
+  'Very Low': { bg: '#fff7ed', border: '#fed7aa', text: '#7c2d12', badge: '#ea580c' },
+  'Low':      { bg: '#fff7ed', border: '#fed7aa', text: '#7c2d12', badge: '#ea580c' },
+  'Moderate': { bg: '#fef3c7', border: '#fcd34d', text: '#78350f', badge: '#d97706' },
+  'High':     { bg: '#fef2f2', border: '#fca5a5', text: '#991b1b', badge: '#dc2626' },
+  'Unknown':  { bg: '#f8fafc', border: '#cbd5e1', text: '#475569', badge: '#94a3b8' },
+};
+
+function EarthquakePredictionCard({ data }: { data: EarthquakePrediction }) {
+  const c   = EQ_COLORS[data.earthquake_risk] ?? EQ_COLORS['Low'];
+  const pct = Math.round(data.probability * 100);
+  const f   = data.features;
+
+  return (
+    <View style={[fpStyles.card, { backgroundColor: c.bg, borderColor: c.border }]}>
+      {/* Header */}
+      <View style={fpStyles.header}>
+        <View style={fpStyles.headerLeft}>
+          <Ionicons name="radio-outline" size={20} color={c.text} />
+          <Text style={[fpStyles.title, { color: c.text }]}>AI EARTHQUAKE FORECAST</Text>
+        </View>
+        <View style={[fpStyles.windowBadge, { backgroundColor: c.border }]}>
+          <Ionicons name="time-outline" size={11} color={c.text} />
+          <Text style={[fpStyles.windowText, { color: c.text }]}> Next 7 days</Text>
+        </View>
+      </View>
+
+      {/* Risk level + probability circle */}
+      <View style={fpStyles.riskRow}>
+        <View style={{ flex: 1 }}>
+          <Text style={[fpStyles.riskLevel, { color: c.text }]}>{data.earthquake_risk} Risk</Text>
+          <Text style={[fpStyles.riskSub, { color: c.text }]}>{data.seismic_zone}</Text>
+          {/* b-value stress badge */}
+          {f.b_value < 0.80 && (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6,
+              backgroundColor: '#fef2f2', borderRadius: 12, paddingHorizontal: 8, paddingVertical: 3,
+              alignSelf: 'flex-start', borderWidth: 1, borderColor: '#fca5a5' }}>
+              <Ionicons name="warning-outline" size={11} color="#dc2626" />
+              <Text style={{ fontSize: 10, color: '#dc2626', fontFamily: 'PlusJakartaSans_600SemiBold' }}>
+                Low b-value: High Stress
+              </Text>
+            </View>
+          )}
+        </View>
+        <View style={[fpStyles.probCircle, { borderColor: c.badge }]}>
+          <Text style={[fpStyles.probNum, { color: c.badge }]}>{pct}%</Text>
+          <Text style={[fpStyles.probLabel, { color: c.text }]}>risk</Text>
+        </View>
+      </View>
+
+      {/* Key signals */}
+      <View style={fpStyles.signals}>
+        <View style={fpStyles.signal}>
+          <Ionicons name="pulse-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            {f.recent_quakes_30d} quakes / 30d
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="trending-up-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            M{f.max_mag_30d.toFixed(1)} max
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="analytics-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            b={f.b_value.toFixed(2)}
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="layers-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            {f.depth_avg_30d.toFixed(0)} km depth
+          </Text>
+        </View>
+        <View style={fpStyles.signal}>
+          <Ionicons name="location-outline" size={14} color={c.text} />
+          <Text style={[fpStyles.signalText, { color: c.text }]}>
+            {f.dist_to_fault_km.toFixed(0)} km to fault
+          </Text>
+        </View>
+        {f.cv_interevent > 1.5 && (
+          <View style={fpStyles.signal}>
+            <Ionicons name="git-branch-outline" size={14} color={c.text} />
+            <Text style={[fpStyles.signalText, { color: c.text }]}>
+              Clustering CV={f.cv_interevent.toFixed(1)}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {/* Top advice tips */}
+      {data.advice.slice(0, 2).map((tip, i) => (
+        <View key={i} style={fpStyles.tip}>
+          <Ionicons name="alert-circle-outline" size={13} color={c.badge} style={{ marginTop: 1 }} />
+          <Text style={[fpStyles.tipText, { color: c.text }]}>{tip}</Text>
+        </View>
+      ))}
+
+      {/* ML model badge + data sources */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 }}>
+        {data.ml_model_active ? (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3,
+            backgroundColor: 'rgba(255,255,255,0.5)', borderRadius: 10,
+            paddingHorizontal: 7, paddingVertical: 3 }}>
+            <Text style={{ fontSize: 10, color: c.text, fontFamily: 'PlusJakartaSans_600SemiBold' }}>
+              ML Model Active (90.7% AUC)
+            </Text>
+          </View>
+        ) : (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3,
+            backgroundColor: 'rgba(255,255,255,0.5)', borderRadius: 10,
+            paddingHorizontal: 7, paddingVertical: 3 }}>
+            <Text style={{ fontSize: 10, color: c.text, fontFamily: 'PlusJakartaSans_400Regular' }}>
+              Physics Model
+            </Text>
+          </View>
+        )}
+        <Text style={{ fontFamily: 'PlusJakartaSans_400Regular', fontSize: 10, color: c.text, opacity: 0.55 }}>
+          USGS · BIS 1893
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 // ─── Risk Gauge ──────────────────────────────────────────────────────────────
 
 function RiskGauge({ level = 'Low', color = '#4CAF50' }: { level: string; color: string }) {
@@ -283,6 +412,7 @@ export default function DashboardScreen() {
   const [weather, setWeather] = useState<WeatherResponse | null>(null);
   const [flood, setFlood] = useState<FloodPrediction | null>(null);
   const [cyclone, setCyclone] = useState<CyclonePrediction | null>(null);
+  const [earthquake, setEarthquake] = useState<EarthquakePrediction | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -329,14 +459,16 @@ export default function DashboardScreen() {
     isRefresh ? setRefreshing(true) : setLoading(true);
     setError(null);
     try {
-      const [weatherData, floodData, cycloneData] = await Promise.all([
+      const [weatherData, floodData, cycloneData, earthquakeData] = await Promise.all([
         fetchWeather(location.lat, location.lon),
         fetchFloodPrediction(location.lat, location.lon).catch(() => null),
         fetchCyclonePrediction(location.lat, location.lon).catch(() => null),
+        fetchEarthquakePrediction(location.lat, location.lon).catch(() => null),
       ]);
       setWeather(weatherData);
       setFlood(floodData);
       setCyclone(cycloneData);
+      setEarthquake(earthquakeData);
     } catch (e: any) {
       setError(e.message || 'Failed to load weather');
     } finally {
@@ -611,6 +743,9 @@ export default function DashboardScreen() {
 
       {/* AI Cyclone Prediction */}
       {cyclone && <CyclonePredictionCard data={cyclone} />}
+
+      {/* AI Earthquake Prediction */}
+      {earthquake && <EarthquakePredictionCard data={earthquake} />}
 
       {/* ── Emergency Section ── */}
       <View style={{ marginBottom: 8 }}>

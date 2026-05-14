@@ -253,6 +253,44 @@ export const fetchCyclonePrediction = async (lat: number, lon: number): Promise<
   return res.data;
 };
 
+// ── Earthquake prediction ─────────────────────────────────────────────────────
+
+export interface EarthquakeFeatures {
+  recent_quakes_7d: number;
+  recent_quakes_30d: number;
+  max_mag_7d: number;
+  max_mag_30d: number;
+  energy_index_30d: number;
+  b_value: number;
+  cv_interevent: number;
+  quake_acceleration: number;
+  depth_avg_30d: number;
+  depth_shallow_frac: number;
+  dist_to_fault_km: number;
+  seismic_zone: number;
+  seismic_zone_label: string;
+  total_events_bbox: number;
+}
+
+export interface EarthquakePrediction {
+  earthquake_risk: 'Very Low' | 'Low' | 'Moderate' | 'High' | 'Unknown';
+  probability: number;
+  probability_pct: string;
+  risk_high: boolean;
+  forecast_window: string;
+  target_radius_km: number;
+  seismic_zone: string;
+  features: EarthquakeFeatures;
+  advice: string[];
+  ml_model_active: boolean;
+  data_sources: string[];
+}
+
+export const fetchEarthquakePrediction = async (lat: number, lon: number): Promise<EarthquakePrediction> => {
+  const res = await api.get('/api/earthquake', { params: { lat, lon }, timeout: 30000 });
+  return res.data;
+};
+
 // ── Alerts (DB-backed) ────────────────────────────────────────────────────────
 
 /** Save freshly fetched alerts to DB for a user */

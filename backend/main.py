@@ -11,7 +11,8 @@ from routes.sos      import router as sos_router
 from routes.predict  import router as predict_router
 from routes.auth     import router as auth_router
 from routes.admin    import router as admin_router
-from routes.cyclone  import router as cyclone_router
+from routes.cyclone     import router as cyclone_router
+from routes.earthquake  import router as earthquake_router
 
 from services.scheduler import run_scheduler
 
@@ -52,6 +53,7 @@ app.include_router(predict_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(cyclone_router)
+app.include_router(earthquake_router)
 
 
 @app.get("/")

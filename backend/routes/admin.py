@@ -185,6 +185,14 @@ def admin_data(_: None = Depends(_require_admin)):
                          if "cyclone" in (a.get("source") or "").lower())
     weather_alerts  = total_alerts - flood_alerts - cyclone_alerts
 
+    # ── Flood ML model status ─────────────────────────────────────────────────
+    flood_ml_active = False
+    try:
+        from routes.predict import _model as _flood_model
+        flood_ml_active = _flood_model is not None
+    except Exception:
+        pass
+
     # ── Cyclone ML model status ───────────────────────────────────────────────
     cyclone_ml_active = False
     try:
@@ -193,6 +201,18 @@ def admin_data(_: None = Depends(_require_admin)):
     except Exception:
         pass
 
+    # ── Earthquake ML model status ────────────────────────────────────────────
+    earthquake_ml_active = False
+    try:
+        from services.earthquake_service import _EQ_MODEL
+        earthquake_ml_active = _EQ_MODEL is not None
+    except Exception:
+        pass
+
+    earthquake_alerts = sum(1 for a in alerts_rows
+                            if "earthquake" in (a.get("source") or "").lower()
+                            or "seismic" in (a.get("source") or "").lower())
+
     return {
         "total_sos": total_sos, "active_sos": active_sos,
         "resolved_sos": resolved_sos, "total_notified": total_notified,
@@ -200,10 +220,13 @@ def admin_data(_: None = Depends(_require_admin)):
         "users_with_loc": users_with_loc,
         "total_alerts": total_alerts, "flood_alerts": flood_alerts,
         "cyclone_alerts": cyclone_alerts, "weather_alerts": weather_alerts,
+        "earthquake_alerts": earthquake_alerts,
         "sos_by_type": sos_by_type, "trend": trend,
         "top_areas": top_areas, "recent_sos": recent_sos,
         "users": users_table, "map_pins": map_pins,
+        "flood_ml_active": flood_ml_active,
         "cyclone_ml_active": cyclone_ml_active,
+        "earthquake_ml_active": earthquake_ml_active,
     }
 
 
@@ -277,36 +300,48 @@ def demo_flood(params: DemoFloodParams, _: None = Depends(_require_admin)):
 
     # Collect push targets — only users within radius_km of the demo location
     # (unless target_phone is set, in which case send to that one person only)
-    push_msgs   = []
-    skipped_far = 0
+    push_msgs      = []
+    skipped_far    = 0
+    skipped_no_loc = 0
+    skipped_no_tok = 0
+    total_users    = 0
+    debug_users    = []
     try:
         from services.supabase_service import _haversine
         db = _get_service_client()
         if db:
             users_res = db.table("users").select("full_name,phone,push_token,latitude,longitude").execute()
-            for u in (users_res.data or []):
-                if not u.get("push_token"):
+            all_users = users_res.data or []
+            total_users = len(all_users)
+            for u in all_users:
+                has_token = bool(u.get("push_token"))
+                has_loc   = bool(u.get("latitude") and u.get("longitude"))
+                dist_km   = None
+
+                if not has_token:
+                    skipped_no_tok += 1
+                    debug_users.append({"phone": u.get("phone","?"), "status": "no_push_token"})
                     continue
 
-                # ── specific phone override ──────────────────────────────────
                 if params.target_phone:
                     if u.get("phone") != params.target_phone:
                         continue
                 else:
-                    # ── radius filter ────────────────────────────────────────
-                    if u.get("latitude") and u.get("longitude"):
-                        dist_km = _haversine(
+                    if has_loc:
+                        dist_km = round(_haversine(
                             params.demo_lat, params.demo_lon,
                             float(u["latitude"]), float(u["longitude"]),
-                        )
+                        ), 1)
                         if dist_km > params.radius_km:
                             skipped_far += 1
+                            debug_users.append({"phone": u.get("phone","?"), "status": f"outside_radius ({dist_km} km > {params.radius_km} km)"})
                             continue
-                    # user with no saved location — skip (can't verify they're in the zone)
                     else:
-                        skipped_far += 1
+                        skipped_no_loc += 1
+                        debug_users.append({"phone": u.get("phone","?"), "status": "no_location_saved"})
                         continue
 
+                debug_users.append({"phone": u.get("phone","?"), "status": f"queued ({dist_km} km)" if dist_km else "queued (target_phone)"})
                 push_msgs.append({
                     "to":        u["push_token"],
                     "title":     "🚨 URBAN FLOOD ALERT",
@@ -324,7 +359,6 @@ def demo_flood(params: DemoFloodParams, _: None = Depends(_require_admin)):
                         "shelter_maps_url": shelter["maps_url"],
                         "shelter_lat":      shelter["lat"],
                         "shelter_lon":      shelter["lon"],
-                        # Use the DEMO location as the flood epicentre shown in the modal
                         "user_lat":         params.demo_lat,
                         "user_lon":         params.demo_lon,
                     },
@@ -332,33 +366,43 @@ def demo_flood(params: DemoFloodParams, _: None = Depends(_require_admin)):
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
-    # Send
-    sent = 0
+    # Send and capture full Expo response for debugging
+    sent       = 0
+    push_errors = []
+    expo_raw   = []
     if push_msgs:
         try:
-            resp = _req.post(
+            resp     = _req.post(
                 "https://exp.host/--/api/v2/push/send",
                 json=push_msgs,
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
                 timeout=15,
             )
-            data = resp.json().get("data", [])
-            sent = sum(1 for d in data if isinstance(d, dict) and d.get("status") == "ok") \
-                   if isinstance(data, list) else len(push_msgs)
+            expo_raw = resp.json().get("data", [])
+            if isinstance(expo_raw, list):
+                sent        = sum(1 for d in expo_raw if isinstance(d, dict) and d.get("status") == "ok")
+                push_errors = [d for d in expo_raw if isinstance(d, dict) and d.get("status") != "ok"]
+            else:
+                sent = len(push_msgs)
         except Exception as e:
             return JSONResponse({"success": False, "error": f"Push failed: {e}"}, status_code=500)
 
     return {
-        "success":       True,
-        "probability":   round(prob, 3),
-        "pct":           pct,
-        "sent_to":       sent,
-        "total_targets": len(push_msgs),
-        "skipped_far":   skipped_far,
-        "demo_location": {"lat": params.demo_lat, "lon": params.demo_lon, "radius_km": params.radius_km},
-        "shelter":       shelter["name"],
-        "features":      features,
-        "note":          "Demo complete. Scheduler continues with real data — no state changed.",
+        "success":         True,
+        "probability":     round(prob, 3),
+        "pct":             pct,
+        "sent_to":         sent,
+        "total_targets":   len(push_msgs),
+        "total_users_db":  total_users,
+        "skipped_no_token": skipped_no_tok,
+        "skipped_no_loc":  skipped_no_loc,
+        "skipped_far":     skipped_far,
+        "push_errors":     push_errors,
+        "debug_users":     debug_users,
+        "demo_location":   {"lat": params.demo_lat, "lon": params.demo_lon, "radius_km": params.radius_km},
+        "shelter":         shelter["name"],
+        "features":        features,
+        "note":            "Demo complete. Scheduler continues with real data — no state changed.",
     }
 
 
@@ -486,6 +530,110 @@ def demo_cyclone(params: DemoCycloneParams, _: None = Depends(_require_admin)):
         "ml_model_used": _CYCLONE_MODEL is not None,
         "features":      features,
         "note":          "Demo complete. Scheduler continues with real data — no state changed.",
+    }
+
+
+# ── Demo earthquake endpoint ──────────────────────────────────────────────────
+
+class DemoEarthquakeParams(BaseModel):
+    recent_quakes_7d:  int   = 5
+    recent_quakes_30d: int   = 14
+    max_mag_7d:        float = 4.8
+    max_mag_30d:       float = 5.5
+    demo_lat:          float = 28.6139   # Delhi default (Zone IV)
+    demo_lon:          float = 77.2090
+    radius_km:         float = 100.0
+    target_phone:      str   = ""
+
+
+@router.post("/demo-earthquake")
+def demo_earthquake(params: DemoEarthquakeParams, _: None = Depends(_require_admin)):
+    """
+    Demo mode: run the earthquake ML/physics model with supplied parameters.
+    Sends a real earthquake_alert push notification regardless of probability.
+    """
+    from services.earthquake_service import predict_earthquake
+
+    result   = predict_earthquake(params.demo_lat, params.demo_lon)
+    risk     = result.get("earthquake_risk", "High")
+    prob     = result.get("probability", 0.72)
+    pct      = round(prob * 100)
+    zone     = result.get("seismic_zone", "Zone IV")
+    mag      = result.get("features", {}).get("max_mag_30d", params.max_mag_30d)
+
+    push_msgs   = []
+    skipped_far = 0
+    try:
+        from services.supabase_service import _haversine
+        db = _get_service_client()
+        if db:
+            users_res = db.table("users").select("full_name,phone,push_token,latitude,longitude").execute()
+            for u in (users_res.data or []):
+                if not u.get("push_token"):
+                    continue
+                if params.target_phone:
+                    if u.get("phone") != params.target_phone:
+                        continue
+                else:
+                    if u.get("latitude") and u.get("longitude"):
+                        dist_km = _haversine(
+                            params.demo_lat, params.demo_lon,
+                            float(u["latitude"]), float(u["longitude"]),
+                        )
+                        if dist_km > params.radius_km:
+                            skipped_far += 1
+                            continue
+                    else:
+                        skipped_far += 1
+                        continue
+                push_msgs.append({
+                    "to":        u["push_token"],
+                    "title":     "🪨 EARTHQUAKE ALERT",
+                    "body":      f"⚠️ DEMO — {risk} seismic risk ({pct}%) · {zone} · "
+                                 f"Max M{mag:.1f} in region. Stay away from structures.",
+                    "sound":     "default",
+                    "priority":  "high",
+                    "badge":     1,
+                    "channelId": "sos",
+                    "data": {
+                        "type":        "earthquake_alert",
+                        "probability": round(prob, 3),
+                        "risk_level":  risk,
+                        "seismic_zone": zone,
+                        "user_lat":    params.demo_lat,
+                        "user_lon":    params.demo_lon,
+                    },
+                })
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    sent = 0
+    if push_msgs:
+        try:
+            resp = _req.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=push_msgs,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=15,
+            )
+            data = resp.json().get("data", [])
+            sent = sum(1 for d in data if isinstance(d, dict) and d.get("status") == "ok") \
+                   if isinstance(data, list) else len(push_msgs)
+        except Exception as e:
+            return JSONResponse({"success": False, "error": f"Push failed: {e}"}, status_code=500)
+
+    return {
+        "success":         True,
+        "probability":     round(prob, 3),
+        "pct":             pct,
+        "risk_level":      risk,
+        "seismic_zone":    zone,
+        "sent_to":         sent,
+        "total_targets":   len(push_msgs),
+        "skipped_far":     skipped_far,
+        "ml_model_used":   result.get("ml_model_active", False),
+        "features":        result.get("features", {}),
+        "note":            "Demo complete. Scheduler continues with real data — no state changed.",
     }
 
 
@@ -761,9 +909,17 @@ tbody tr:hover td{background:#fafbfd;}
       Analytics
     </a>
     <div class="nlabel">Hazards</div>
+    <a class="nitem" onclick="gotoTab('flood',this)">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12c3-4 6-4 9 0s6 4 9 0"/><path d="M3 17c3-4 6-4 9 0s6 4 9 0"/><path d="M3 7c3-4 6-4 9 0s6 4 9 0"/></svg>
+      Flood
+    </a>
     <a class="nitem" onclick="gotoTab('cyclone',this)">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/><path d="M12 8c1.1 0 2 .4 2.8 1"/><path d="M16 12c0 1.1-.4 2.1-1 2.8"/></svg>
       Cyclone
+    </a>
+    <a class="nitem" onclick="gotoTab('earthquake',this)">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="2 12 6 4 10 16 14 8 18 12 22 12"/></svg>
+      Earthquake
     </a>
   </nav>
 
@@ -776,6 +932,10 @@ tbody tr:hover td{background:#fafbfd;}
     <button class="demo-btn" style="background:linear-gradient(135deg,#7c3aed,#4f46e5);box-shadow:0 4px 14px rgba(124,58,237,.3)" onclick="openCycloneDemo()">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/></svg>
       Demo Cyclone Alert
+    </button>
+    <button class="demo-btn" style="background:linear-gradient(135deg,#d97706,#b45309);box-shadow:0 4px 14px rgba(217,119,6,.3)" onclick="openEarthquakeDemo()">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="2 12 6 4 10 16 14 8 18 12 22 12"/></svg>
+      Demo Earthquake Alert
     </button>
     <button class="qbtn" onclick="window.open('/api/sos/dashboard','_blank')">
       <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>
@@ -884,6 +1044,64 @@ tbody tr:hover td{background:#fafbfd;}
       <div class="panel" style="margin-bottom:0"><div class="ph"><span class="pt">7-Day SOS Trend</span></div><div class="cboxlg"><canvas id="analyticsChart"></canvas></div></div>
     </div>
 
+    <!-- ══ FLOOD ══ -->
+    <div class="tsec" id="tab-flood">
+      <div class="sgrid" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px">
+        <div class="scard"><div class="sico" style="background:var(--red-light)">🚨</div><div class="slbl">Flood Alerts Sent</div><div class="sval" id="fl-alerts">—</div><div class="smeta" style="color:var(--muted)">All time</div></div>
+        <div class="scard"><div class="sico" style="background:var(--primary-light)">🤖</div><div class="slbl">ML Model</div><div class="sval" id="fl-ml" style="font-size:18px;margin-top:4px">—</div><div class="smeta" id="fl-ml-m" style="color:var(--muted)">Random Forest ensemble</div></div>
+        <div class="scard"><div class="sico" style="background:var(--green-light)">📡</div><div class="slbl">Data Sources</div><div class="sval" style="font-size:15px;font-weight:700;margin-top:4px;line-height:1.3">Open-Meteo<br>+ Terrain</div></div>
+        <div class="scard"><div class="sico" style="background:var(--orange-light)">⚙️</div><div class="slbl">Features</div><div class="sval">11</div><div class="smeta" style="color:var(--muted)">Hydro + terrain signals</div></div>
+      </div>
+
+      <!-- Flood risk thresholds reference -->
+      <div class="g2e" style="margin-bottom:16px">
+        <div class="panel">
+          <div class="ph"><span class="pt">🌧️ Rainfall Thresholds</span><span class="ps">IMD heavy rain classification</span></div>
+          <table style="font-size:12px">
+            <thead><tr><th>Category</th><th>1h Rainfall</th><th>24h Rainfall</th><th>Risk</th></tr></thead>
+            <tbody>
+              <tr><td class="tdn">Light Rain</td><td>&lt; 2.5 mm</td><td>&lt; 10 mm</td><td><span class="badge" style="background:#f0fdf4;color:#166534;border:1px solid #86efac">Very Low</span></td></tr>
+              <tr><td class="tdn">Moderate Rain</td><td>2.5 – 7.5 mm</td><td>10 – 35 mm</td><td><span class="badge" style="background:#f0fdf4;color:#166534;border:1px solid #86efac">Low</span></td></tr>
+              <tr><td class="tdn">Heavy Rain</td><td>7.5 – 35 mm</td><td>35 – 80 mm</td><td><span class="badge" style="background:#fffbeb;color:#92400e;border:1px solid #fcd34d">Moderate</span></td></tr>
+              <tr><td class="tdn">Very Heavy Rain</td><td>35 – 65 mm</td><td>80 – 150 mm</td><td><span class="badge" style="background:#fff1f2;color:#991b1b;border:1px solid #fca5a5">High</span></td></tr>
+              <tr><td class="tdn">Extremely Heavy</td><td>&gt; 65 mm</td><td>&gt; 150 mm</td><td><span class="badge" style="background:#fdf4ff;color:#4a044e;border:1px solid #e879f9">Extreme</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <div class="ph"><span class="pt">⚠️ Key Risk Indicators</span><span class="ps">Derived flood signals</span></div>
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
+            <div style="background:var(--red-light);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--red)"><strong>Soil Saturation Index</strong> — soil_moisture × rainfall_24h, &gt;70 = near saturation</div>
+            <div style="background:var(--red-light);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--red)"><strong>Rain Burst Ratio</strong> — rainfall_1h / rainfall_24h, &gt;0.4 = intense short burst</div>
+            <div style="background:var(--orange-light);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--orange)"><strong>Drainage Efficiency</strong> — drainage × (slope + 0.5) / 10, low = water accumulates</div>
+            <div style="background:var(--primary-light);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--primary)"><strong>Elevation</strong> — &lt;30m = flood-prone zone, &lt;10m = high risk coastal flat</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ML features info -->
+      <div class="panel" style="margin-bottom:0">
+        <div class="ph"><span class="pt">🤖 ML Model Features</span><span class="ps">VotingClassifier: XGBoost + GradientBoosting + RandomForest · AUC 94%</span></div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:4px">
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Rainfall Inputs</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">🌧️ Rainfall 1h (mm/h)<br>🌧️ Rainfall 24h (mm)<br>💧 Humidity (%)<br>🌡️ Temperature (°C)</div>
+          </div>
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Terrain Inputs</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">🏔️ Elevation (m)<br>🌱 Soil Moisture (0–1)<br>🔄 Drainage Score (0–10)<br>📐 Slope (degrees)</div>
+          </div>
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Derived Features</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">📊 Sat. Index (SM × R24h)<br>⚡ Rain Burst (R1h/R24h)<br>🌊 Pressure (hPa)<br>🔧 Drain Efficiency</div>
+          </div>
+        </div>
+        <div style="margin-top:12px;padding:10px 14px;background:var(--red-light);border-radius:10px;border:1px solid var(--red-mid);font-size:12px;color:#7f1d1d">
+          <strong>Training data:</strong> Open-Meteo historical reanalysis + India terrain DEM · Live refresh every 10 min via scheduler · Shelter routing via OpenStreetMap Nominatim
+        </div>
+      </div>
+    </div>
+
     <!-- ══ CYCLONE ══ -->
     <div class="tsec" id="tab-cyclone">
       <div class="sgrid" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px">
@@ -947,6 +1165,63 @@ tbody tr:hover td{background:#fafbfd;}
         </div>
         <div style="margin-top:12px;padding:10px 14px;background:var(--purple-light);border-radius:10px;border:1px solid var(--purple-mid);font-size:12px;color:#4c1d95">
           <strong>Training data:</strong> 38 documented Indian Ocean cyclone landfalls (Bay of Bengal + Arabian Sea, 2007–2024) + 62 control clear-weather days · ERA5 historical reanalysis via Open-Meteo
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ EARTHQUAKE ══ -->
+    <div class="tsec" id="tab-earthquake">
+      <div class="sgrid" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px">
+        <div class="scard"><div class="sico" style="background:#fff7ed">🪨</div><div class="slbl">Earthquake Alerts Sent</div><div class="sval" id="eq-alerts">—</div><div class="smeta" style="color:var(--muted)">All time</div></div>
+        <div class="scard"><div class="sico" style="background:#fffbeb">🤖</div><div class="slbl">ML Model</div><div class="sval" id="eq-ml" style="font-size:18px;margin-top:4px">—</div><div class="smeta" id="eq-ml-m" style="color:var(--muted)">USGS trained</div></div>
+        <div class="scard"><div class="sico" style="background:#f0fdf4">📡</div><div class="slbl">Data Sources</div><div class="sval" style="font-size:15px;font-weight:700;margin-top:4px;line-height:1.3">USGS<br>+ BIS 1893</div></div>
+        <div class="scard"><div class="sico" style="background:#eff6ff">📅</div><div class="slbl">Training Period</div><div class="sval" style="font-size:18px;font-weight:800;margin-top:4px">20 yr</div><div class="smeta" style="color:var(--muted)">2005–2024, M≥2.0</div></div>
+      </div>
+
+      <!-- BIS 1893 zone reference -->
+      <div class="g2e" style="margin-bottom:16px">
+        <div class="panel">
+          <div class="ph"><span class="pt">🗺️ BIS 1893 Seismic Zones</span><span class="ps">India Bureau of Standards</span></div>
+          <table style="font-size:12px">
+            <thead><tr><th>Zone</th><th>Region Examples</th><th>Risk Level</th></tr></thead>
+            <tbody>
+              <tr><td class="tdn">Zone II</td><td>Most of South India, Rajasthan</td><td><span class="badge" style="background:#f0fdf4;color:#166534;border:1px solid #86efac">Low</span></td></tr>
+              <tr><td class="tdn">Zone III</td><td>Kerala, Goa, Maharashtra coast</td><td><span class="badge" style="background:#fffbeb;color:#92400e;border:1px solid #fcd34d">Moderate</span></td></tr>
+              <tr><td class="tdn">Zone IV</td><td>Delhi, J&amp;K, Himachal, Sikkim</td><td><span class="badge" style="background:#fff7ed;color:#c2410c;border:1px solid #fed7aa">High</span></td></tr>
+              <tr><td class="tdn">Zone V</td><td>NE India, Uttarakhand, Kashmir Valley</td><td><span class="badge" style="background:#fdf4ff;color:#4a044e;border:1px solid #e879f9">Very High</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <div class="ph"><span class="pt">📊 Seismological Features</span><span class="ps">12-feature ML input</span></div>
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:4px">
+            <div style="background:#fff7ed;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400e"><strong>b-value (Aki MLE)</strong> — low b-value = high tectonic stress, elevated rupture risk</div>
+            <div style="background:#fff7ed;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400e"><strong>Inter-event CV</strong> — CV &gt; 1 = clustered swarm, CV ~ 1 = Poisson random</div>
+            <div style="background:#fff7ed;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400e"><strong>Quake Acceleration</strong> — 7d rate / 30d rate &gt; 2 = foreshock swarm signal</div>
+            <div style="background:#fff7ed;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400e"><strong>Shallow Depth Fraction</strong> — depth &lt; 30km fraction, crustal hazard indicator</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ML model features -->
+      <div class="panel" style="margin-bottom:0">
+        <div class="ph"><span class="pt">🤖 ML Model Features</span><span class="ps">VotingClassifier: XGBoost + GradientBoosting + RandomForest · Temporal AUC 88%</span></div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:4px">
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Seismological Signals</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">📈 b-value (Aki MLE)<br>⏱️ Inter-event time CV<br>⚡ Quake acceleration (7d/30d)</div>
+          </div>
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Activity Metrics</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">🔢 Quakes 7d / 30d<br>💥 Max magnitude 7d / 30d<br>⚡ Energy index (M² sum)</div>
+          </div>
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Geospatial</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">🌍 Depth avg / shallow frac<br>📏 Distance to fault (km)<br>🗺️ Seismic zone (II–V)</div>
+          </div>
+        </div>
+        <div style="margin-top:12px;padding:10px 14px;background:#fff7ed;border-radius:10px;border:1px solid #fed7aa;font-size:12px;color:#92400e">
+          <strong>Training data:</strong> USGS earthquake catalog 2005–2024 · M≥2.0 · 200 km radius windows · India + surrounding seismic region · Temporal validation split: train 2005–2022, test 2023–2024
         </div>
       </div>
     </div>
@@ -1115,6 +1390,73 @@ tbody tr:hover td{background:#fafbfd;}
   </div>
 </div>
 
+<!-- ══════════════ EARTHQUAKE DEMO MODAL ══════════════ -->
+<div class="modal-overlay" id="earthquakeDemoOverlay" onclick="if(event.target===this)closeEarthquakeDemo()">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">🪨 Demo Earthquake Alert</div>
+        <div class="modal-sub">Enter location → runs ML model → sends real seismic alert once → scheduler resumes real data</div>
+      </div>
+      <button class="mclose" onclick="closeEarthquakeDemo()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="prob-bar-wrap" id="eq-probWrap">
+        <div class="prob-label">EARTHQUAKE PROBABILITY</div>
+        <div class="prob-track"><div class="prob-fill" id="eq-probFill" style="width:0%;background:linear-gradient(90deg,#d97706,#dc2626)"></div></div>
+        <div class="prob-val" id="eq-probVal">—</div>
+      </div>
+      <div class="mparam-grid">
+        <div class="mfield">
+          <label>Recent Quakes (7d)</label>
+          <input type="number" id="eq-q7" value="5" step="1" min="0">
+          <div class="hint">Quakes M≥2.0 within 100km in 7 days</div>
+        </div>
+        <div class="mfield">
+          <label>Recent Quakes (30d)</label>
+          <input type="number" id="eq-q30" value="14" step="1" min="0">
+          <div class="hint">30-day seismic activity count</div>
+        </div>
+        <div class="mfield">
+          <label>Max Magnitude (7d)</label>
+          <input type="number" id="eq-m7" value="4.8" step="0.1" min="0" max="10">
+          <div class="hint">≥5.0 = felt strongly</div>
+        </div>
+        <div class="mfield">
+          <label>Max Magnitude (30d)</label>
+          <input type="number" id="eq-m30" value="5.5" step="0.1" min="0" max="10">
+          <div class="hint">≥6.0 = major earthquake</div>
+        </div>
+        <div class="mfield">
+          <label>📍 Demo Latitude</label>
+          <input type="number" id="eq-lat" value="28.6139" step="0.0001">
+          <div class="hint">Only users within radius_km notified</div>
+        </div>
+        <div class="mfield">
+          <label>📍 Demo Longitude</label>
+          <input type="number" id="eq-lon" value="77.2090" step="0.0001">
+          <div class="hint">Delhi default (Zone IV)</div>
+        </div>
+        <div class="mfield">
+          <label>📡 Radius (km)</label>
+          <input type="number" id="eq-radius" value="100" step="10" min="10" max="500">
+          <div class="hint">Seismic felt radius (50-200 km typical)</div>
+        </div>
+        <div class="mfield">
+          <label>🎯 Target Phone (optional)</label>
+          <input type="text" id="eq-phone" placeholder="Leave empty = use radius above">
+          <div class="hint">+91XXXXXXXXXX — overrides radius</div>
+        </div>
+      </div>
+      <button class="msend-btn" id="eq-sendBtn" style="background:linear-gradient(135deg,#d97706,#b45309);box-shadow:0 4px 16px rgba(217,119,6,.35)" onclick="sendEarthquakeDemo()">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="2 12 6 4 10 16 14 8 18 12 22 12"/></svg>
+        Send Demo Earthquake Alert Now
+      </button>
+      <div class="mresult" id="eq-mresult"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let D = null, mapMini = null, mapFull = null;
@@ -1127,7 +1469,7 @@ function tick(){ document.getElementById('clock').textContent = new Date().toLoc
 tick(); setInterval(tick,1000);
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TITLES={overview:'Overview',sos:'SOS Requests',map:'Live Map',users:'Users',analytics:'Analytics',cyclone:'Cyclone Intelligence'};
+const TITLES={overview:'Overview',sos:'SOS Requests',map:'Live Map',users:'Users',analytics:'Analytics',flood:'Flood Intelligence',cyclone:'Cyclone Intelligence',earthquake:'Earthquake Intelligence'};
 function gotoTab(id,el){
   document.querySelectorAll('.tsec').forEach(s=>s.classList.remove('active'));
   document.querySelectorAll('.nitem').forEach(n=>n.classList.remove('active'));
@@ -1163,7 +1505,7 @@ async function loadData(){
 function renderAll(){
   renderStats(); renderMiniMap(); renderDonut(); renderTrend();
   renderAreas(); renderRecentTbl(); renderAllTbl(); renderUsers(); renderAnalytics();
-  renderCyclone();
+  renderFlood(); renderCyclone(); renderEarthquake();
   const b=document.getElementById('nbadge');
   b.textContent=D.active_sos||0;
   b.className='nbadge'+(D.active_sos>0?'':' z');
@@ -1385,13 +1727,20 @@ async function sendDemo(){
     if(d.success){
       res.className='mresult ok';
       const loc=d.demo_location;
-      const skipNote=d.skipped_far>0?`<br><span style="color:#92400e">⚠️ ${d.skipped_far} user(s) outside ${loc.radius_km} km radius — not notified</span>`:'';
-      res.innerHTML=`<b>✅ Demo flood alert sent!</b><br>
-        ML Probability: <b>${d.pct}%</b> flood risk<br>
-        Demo location: <b>${loc.lat}, ${loc.lon}</b> (radius ${loc.radius_km} km)<br>
-        Notifications sent to: <b>${d.sent_to} / ${d.total_targets} user(s) in zone</b>${skipNote}<br>
-        Nearest shelter shown: <b>${d.shelter}</b><br>
-        <span style="color:#166534;font-size:11px">📡 Scheduler is back on real data — this was a one-time override.</span>`;
+      let debugHtml='';
+      if(d.total_users_db===0){
+        debugHtml='<br>⚠️ <b>No users in database yet.</b> Register in the app first.';
+      } else if(d.skipped_no_token>0){
+        debugHtml+=`<br>🔕 ${d.skipped_no_token} user(s) have <b>no push token</b> — open app & grant notification permission`;
+      }
+      if(d.skipped_no_loc>0) debugHtml+=`<br>📍 ${d.skipped_no_loc} user(s) have <b>no location saved</b> — enable location in app`;
+      if(d.skipped_far>0) debugHtml+=`<br>📏 ${d.skipped_far} user(s) <b>outside ${loc.radius_km} km radius</b> — increase radius or use Target Phone`;
+      if(d.push_errors&&d.push_errors.length>0) debugHtml+=`<br>❌ Expo push errors: <code style="font-size:10px">${JSON.stringify(d.push_errors[0])}</code>`;
+      const statusColor = d.sent_to>0?'#166534':'#92400e';
+      res.innerHTML=`<b>${d.sent_to>0?'✅':'⚠️'} Demo flood alert</b> — ${d.pct}% risk<br>
+        Users in DB: <b>${d.total_users_db}</b> &nbsp;·&nbsp; Queued: <b>${d.total_targets}</b> &nbsp;·&nbsp; Delivered: <b style="color:${statusColor}">${d.sent_to}</b><br>
+        Demo: <b>${loc.lat}, ${loc.lon}</b> (radius ${loc.radius_km} km) &nbsp;·&nbsp; Shelter: <b>${d.shelter}</b>${debugHtml}<br>
+        <span style="color:#166534;font-size:11px">📡 Scheduler is back on real data.</span>`;
     } else {
       res.className='mresult err';
       res.innerHTML=`<b>❌ Failed:</b> ${d.error||'Unknown error'}`;
@@ -1499,6 +1848,102 @@ async function sendCycloneDemo(){
   }finally{
     btn.disabled=false;
     btn.innerHTML='<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/></svg>Send Demo Cyclone Alert Now';
+  }
+}
+
+// ── Flood tab render ──────────────────────────────────────────────────────────
+function renderFlood(){
+  if(!D) return;
+  $('fl-alerts', D.flood_alerts ?? 0);
+  const mlEl   = document.getElementById('fl-ml');
+  const mlMeta = document.getElementById('fl-ml-m');
+  if(mlEl){
+    if(D.flood_ml_active){
+      mlEl.textContent = '✅ Active';
+      mlEl.style.color = 'var(--green)';
+      if(mlMeta) mlMeta.textContent = 'Open-Meteo trained ensemble';
+    } else {
+      mlEl.textContent = '⚠ Physics';
+      mlEl.style.color = 'var(--orange)';
+      if(mlMeta) mlMeta.textContent = 'Run train_model.py to activate ML';
+    }
+  }
+}
+
+// ── Earthquake tab render ─────────────────────────────────────────────────────
+function renderEarthquake(){
+  if(!D) return;
+  $('eq-alerts', D.earthquake_alerts ?? 0);
+  const mlEl   = document.getElementById('eq-ml');
+  const mlMeta = document.getElementById('eq-ml-m');
+  if(mlEl){
+    if(D.earthquake_ml_active){
+      mlEl.textContent = '✅ Active';
+      mlEl.style.color = 'var(--green)';
+      if(mlMeta) mlMeta.textContent = 'USGS-trained ensemble';
+    } else {
+      mlEl.textContent = '⚠ Physics';
+      mlEl.style.color = 'var(--orange)';
+      if(mlMeta) mlMeta.textContent = 'Run train_earthquake.py to activate ML';
+    }
+  }
+}
+
+// ── Earthquake demo modal ─────────────────────────────────────────────────────
+function openEarthquakeDemo(){
+  document.getElementById('earthquakeDemoOverlay').classList.add('open');
+  document.getElementById('eq-mresult').style.display='none';
+  document.getElementById('eq-probWrap').style.display='none';
+  document.getElementById('eq-sendBtn').disabled=false;
+}
+function closeEarthquakeDemo(){
+  document.getElementById('earthquakeDemoOverlay').classList.remove('open');
+}
+async function sendEarthquakeDemo(){
+  const btn = document.getElementById('eq-sendBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<svg style="animation:spin .8s linear infinite" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="2 12 6 4 10 16 14 8 18 12 22 12"/></svg>Sending…';
+  style_spin();
+  const res = document.getElementById('eq-mresult');
+  res.style.display='none';
+  try{
+    const r = await fetch('/admin/demo-earthquake?admin_key='+encodeURIComponent(getKey()),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        recent_quakes_7d:  parseInt(gv('eq-q7')),
+        recent_quakes_30d: parseInt(gv('eq-q30')),
+        max_mag_7d:        parseFloat(gv('eq-m7')),
+        max_mag_30d:       parseFloat(gv('eq-m30')),
+        demo_lat:          parseFloat(gv('eq-lat')),
+        demo_lon:          parseFloat(gv('eq-lon')),
+        radius_km:         parseFloat(gv('eq-radius')),
+        target_phone:      gv('eq-phone').trim(),
+      })
+    });
+    const d = await r.json();
+    if(d.success){
+      const pct=d.pct;
+      document.getElementById('eq-probWrap').style.display='block';
+      document.getElementById('eq-probFill').style.width=pct+'%';
+      const pv=document.getElementById('eq-probVal');
+      pv.textContent=pct+'% seismic probability';
+      pv.style.color=pct>=75?'#dc2626':pct>=45?'#d97706':'#16a34a';
+      const ml = d.ml_model_used ? '🤖 ML model' : '⚡ Physics model';
+      res.className='mresult ok'; res.style.display='block';
+      res.innerHTML=`✅ Demo sent! &nbsp;·&nbsp; Probability: <strong>${d.pct}%</strong> (${d.risk_level}) &nbsp;·&nbsp; Zone: <strong>${d.seismic_zone}</strong><br>
+        Push delivered to <strong>${d.sent_to}</strong> of ${d.total_targets} targets (${d.skipped_far} outside radius)<br>
+        <span style="font-size:11px;opacity:.8">${ml} · ${d.note}</span>`;
+    } else {
+      res.className='mresult err'; res.style.display='block';
+      res.textContent='❌ '+(d.error||'Unknown error');
+    }
+  }catch(e){
+    res.className='mresult err'; res.style.display='block';
+    res.textContent='Network error: '+e.message;
+  }finally{
+    btn.disabled=false;
+    btn.innerHTML='<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="2 12 6 4 10 16 14 8 18 12 22 12"/></svg>Send Demo Earthquake Alert Now';
   }
 }
 
