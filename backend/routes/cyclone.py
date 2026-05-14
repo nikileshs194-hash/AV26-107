@@ -24,4 +24,29 @@ def cyclone_prediction(
         result = predict_cyclone(lat, lon)
         return result
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Cyclone prediction failed: {e}")
+        # Return a safe degraded response instead of 502.
+        # A 502 breaks the mobile UI; a 200 with "Very Low" risk lets the app
+        # render normally while showing data-unavailable advice.
+        print(f"[Cyclone] Prediction failed, returning fallback: {e}")
+        return {
+            "cyclone_risk":    "Unknown",
+            "probability":     0.0,
+            "category":        "No Data",
+            "cyclone_likely":  False,
+            "features": {
+                "wind_speed_kmh": 0, "wind_gusts_kmh": 0,
+                "surface_pressure_hpa": 1013, "pressure_6h_ago_hpa": 1013,
+                "pressure_drop_6h": 0, "pressure_anomaly_hpa": 0,
+                "cape_jkg": 0, "precipitation_mm": 0, "humidity": 0,
+                "temperature_2m": 28, "tropical_instability": 0,
+                "wind_intensity_index": 0, "wind_shear_kmh": 0,
+                "humidity_500hpa": 50, "coastal_proximity_km": 0,
+                "season_factor": 1.0, "lat_abs": abs(lat),
+                "gdacs_active": False, "gdacs_name": "",
+                "gdacs_distance_km": 9999, "gdacs_alert_level": "",
+            },
+            "advice": ["Real-time atmospheric data temporarily unavailable. Please try again shortly."],
+            "data_sources":    ["Unavailable"],
+            "forecast_window": "Current conditions + 6-hour trend",
+            "ml_model_active": False,
+        }

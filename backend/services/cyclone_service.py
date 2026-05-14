@@ -20,6 +20,7 @@ Fallback: IMD (India Meteorological Department) threshold-based physics model.
 
 import math
 import os
+import time
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -190,41 +191,46 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
     """
     Fetch all cyclone-relevant atmospheric features for the given location.
     Uses Open-Meteo (current + 6-h past hourly) and GDACS.
+    Retries once on timeout before raising.
     """
-    resp = requests.get(
-        _OPEN_METEO,
-        params={
-            "latitude":        lat,
-            "longitude":       lon,
-            "current": [
-                "wind_speed_10m",
-                "wind_gusts_10m",
-                "surface_pressure",
-                "cape",
-                "precipitation",
-                "relative_humidity_2m",
-                "temperature_2m",
-                "weather_code",
-            ],
-            "hourly": [
-                "surface_pressure",
-                "wind_speed_10m",
-                "wind_gusts_10m",
-                # Pressure-level wind for vertical wind shear (200-850 hPa)
-                # Gray (1979): high shear (>60 km/h) inhibits cyclone organization
-                "wind_speed_850hPa",
-                "wind_speed_200hPa",
-                # Mid-level humidity: dry air intrusion at 500 hPa kills cyclones
-                "relative_humidity_500hPa",
-            ],
-            "past_hours":      6,
-            "forecast_hours":  1,
-            "timezone":        "auto",
-            "wind_speed_unit": "kmh",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
+    _params = {
+        "latitude":        lat,
+        "longitude":       lon,
+        "current": [
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "surface_pressure",
+            "cape",
+            "precipitation",
+            "relative_humidity_2m",
+            "temperature_2m",
+            "weather_code",
+        ],
+        "hourly": [
+            "surface_pressure",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "wind_speed_850hPa",
+            "wind_speed_200hPa",
+            "relative_humidity_500hPa",
+        ],
+        "past_hours":      6,
+        "forecast_hours":  1,
+        "timezone":        "auto",
+        "wind_speed_unit": "kmh",
+    }
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = requests.get(_OPEN_METEO, params=_params, timeout=14)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(1)
+    else:
+        raise last_err
     d = resp.json()
 
     cur    = d.get("current", {})

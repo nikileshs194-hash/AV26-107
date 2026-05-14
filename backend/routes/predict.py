@@ -1,5 +1,6 @@
 import os
 import math
+import time
 import requests
 import joblib
 import pandas as pd
@@ -106,29 +107,41 @@ def _fetch_features(lat: float, lon: float) -> dict:
     - Uses current soil moisture (ground saturation state right now)
     - Uses forecasted rainfall, humidity, temp, pressure at +12h
     - rainfall_24h = past 12h observed + next 12h forecast (full 24h window)
+    Retries once on timeout before raising.
     """
-    resp = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude":  lat,
-            "longitude": lon,
-            "current": [
-                "soil_moisture_0_to_1cm",   # ground saturation now
-            ],
-            "hourly": [
-                "precipitation",
-                "relative_humidity_2m",
-                "temperature_2m",
-                "surface_pressure",
-                "soil_moisture_0_to_1cm",
-            ],
-            "past_hours":     12,   # last 12h observed
-            "forecast_hours": 13,   # next 12h forecast (+1 for index safety)
-            "timezone":       "auto",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
+    params = {
+        "latitude":  lat,
+        "longitude": lon,
+        "current": [
+            "soil_moisture_0_to_1cm",
+        ],
+        "hourly": [
+            "precipitation",
+            "relative_humidity_2m",
+            "temperature_2m",
+            "surface_pressure",
+            "soil_moisture_0_to_1cm",
+        ],
+        "past_hours":     12,
+        "forecast_hours": 13,
+        "timezone":       "auto",
+    }
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=params,
+                timeout=14,
+            )
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(1)
+    else:
+        raise last_err
     d = resp.json()
 
     cur    = d.get("current", {})
@@ -222,14 +235,35 @@ def predict_flood(
 ):
     if _model is None:
         raise HTTPException(status_code=503, detail="Model not loaded. Run collect_and_train.py first.")
+
     try:
         features = _fetch_features(lat, lon)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch weather data: {e}")
+        # Return a safe degraded response instead of 502.
+        # A 502 crashes the mobile UI; a 200 with unknown risk lets the app
+        # show a "data unavailable" state gracefully.
+        print(f"[Predict] Weather fetch failed, returning fallback: {e}")
+        return {
+            "flood_predicted":  False,
+            "probability":      0.0,
+            "risk_level":       "Unknown",
+            "forecast_window":  "12 hours",
+            "features": {
+                "rainfall_1h": 0, "rainfall_24h": 0, "humidity": 0,
+                "temperature": 0, "elevation": 0, "soil_moisture": 0,
+                "drainage": 0, "slope": 0, "pressure": 0,
+                "sat_index": 0, "rain_burst": 0, "drain_eff": 0,
+            },
+            "advice": ["Real-time weather data temporarily unavailable. Please try again shortly."],
+        }
 
-    df = pd.DataFrame([features])
-    prob  = float(_model.predict_proba(df)[0][1])
-    flood = bool(_model.predict(df)[0])
+    try:
+        df    = pd.DataFrame([features])
+        prob  = float(_model.predict_proba(df)[0][1])
+        flood = bool(_model.predict(df)[0])
+    except Exception as e:
+        print(f"[Predict] Model inference failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Model error: {e}")
 
     return {
         "flood_predicted":   flood,
