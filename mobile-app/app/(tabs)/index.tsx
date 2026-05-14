@@ -201,11 +201,29 @@ function CyclonePredictionCard({ data }: { data: CyclonePrediction }) {
         </View>
       ))}
 
-      {/* Data sources */}
-      <Text style={{ fontFamily: 'PlusJakartaSans_400Regular', fontSize: 10,
-        color: c.text, opacity: 0.55, marginTop: 6 }}>
-        Sources: {data.data_sources.join(' · ')} · IMD Scale
-      </Text>
+      {/* ML model badge + data sources */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 }}>
+        {data.ml_model_active ? (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3,
+            backgroundColor: 'rgba(255,255,255,0.5)', borderRadius: 10,
+            paddingHorizontal: 7, paddingVertical: 3 }}>
+            <Text style={{ fontSize: 10, color: c.text, fontFamily: 'PlusJakartaSans_600SemiBold' }}>
+              🤖 ML Model Active
+            </Text>
+          </View>
+        ) : (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3,
+            backgroundColor: 'rgba(255,255,255,0.5)', borderRadius: 10,
+            paddingHorizontal: 7, paddingVertical: 3 }}>
+            <Text style={{ fontSize: 10, color: c.text, fontFamily: 'PlusJakartaSans_400Regular' }}>
+              ⚡ Physics Model
+            </Text>
+          </View>
+        )}
+        <Text style={{ fontFamily: 'PlusJakartaSans_400Regular', fontSize: 10, color: c.text, opacity: 0.55 }}>
+          IMD Scale · GDACS
+        </Text>
+      </View>
     </View>
   );
 }

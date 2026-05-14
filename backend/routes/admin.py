@@ -177,21 +177,33 @@ def admin_data(_: None = Depends(_require_admin)):
     except Exception:
         alerts_rows = []
 
-    total_alerts   = len(alerts_rows)
-    flood_alerts   = sum(1 for a in alerts_rows
-                        if "flood" in (a.get("source") or "").lower()
-                        or a.get("severity") == "Extreme")
-    weather_alerts = total_alerts - flood_alerts
+    total_alerts    = len(alerts_rows)
+    flood_alerts    = sum(1 for a in alerts_rows
+                         if "flood" in (a.get("source") or "").lower()
+                         or a.get("severity") == "Extreme")
+    cyclone_alerts  = sum(1 for a in alerts_rows
+                         if "cyclone" in (a.get("source") or "").lower())
+    weather_alerts  = total_alerts - flood_alerts - cyclone_alerts
+
+    # ── Cyclone ML model status ───────────────────────────────────────────────
+    cyclone_ml_active = False
+    try:
+        from services.cyclone_service import _CYCLONE_MODEL
+        cyclone_ml_active = _CYCLONE_MODEL is not None
+    except Exception:
+        pass
 
     return {
         "total_sos": total_sos, "active_sos": active_sos,
         "resolved_sos": resolved_sos, "total_notified": total_notified,
         "total_users": total_users, "users_with_token": users_with_token,
         "users_with_loc": users_with_loc,
-        "total_alerts": total_alerts, "flood_alerts": flood_alerts, "weather_alerts": weather_alerts,
+        "total_alerts": total_alerts, "flood_alerts": flood_alerts,
+        "cyclone_alerts": cyclone_alerts, "weather_alerts": weather_alerts,
         "sos_by_type": sos_by_type, "trend": trend,
         "top_areas": top_areas, "recent_sos": recent_sos,
         "users": users_table, "map_pins": map_pins,
+        "cyclone_ml_active": cyclone_ml_active,
     }
 
 
@@ -345,6 +357,133 @@ def demo_flood(params: DemoFloodParams, _: None = Depends(_require_admin)):
         "skipped_far":   skipped_far,
         "demo_location": {"lat": params.demo_lat, "lon": params.demo_lon, "radius_km": params.radius_km},
         "shelter":       shelter["name"],
+        "features":      features,
+        "note":          "Demo complete. Scheduler continues with real data — no state changed.",
+    }
+
+
+# ── Demo cyclone endpoint ─────────────────────────────────────────────────────
+
+class DemoCycloneParams(BaseModel):
+    wind_gusts_kmh:       float = 95.0
+    surface_pressure_hpa: float = 975.0
+    pressure_drop_6h:     float = 6.0
+    cape_jkg:             float = 1500.0
+    demo_lat:             float = 13.0827   # Chennai default
+    demo_lon:             float = 80.2707
+    radius_km:            float = 200.0
+    target_phone:         str   = ""
+
+
+@router.post("/demo-cyclone")
+def demo_cyclone(params: DemoCycloneParams, _: None = Depends(_require_admin)):
+    """
+    Demo mode: run the cyclone ML/physics model with supplied parameters.
+    Sends a real cyclone_alert push notification regardless of probability.
+    """
+    from services.cyclone_service import (
+        _CYCLONE_MODEL, CYCLONE_FEATURES, _coast_distance_km, _season_factor,
+        _imd_category, _risk_label, compute_probability,
+    )
+    from datetime import datetime, timezone as _tz
+
+    coast_km = round(_coast_distance_km(params.demo_lat, params.demo_lon), 1)
+    month    = datetime.now(_tz.utc).month
+    s_factor = _season_factor(month)
+
+    features = {
+        "wind_gusts_kmh":        params.wind_gusts_kmh,
+        "surface_pressure_hpa":  params.surface_pressure_hpa,
+        "pressure_drop_6h":      params.pressure_drop_6h,
+        "cape_jkg":              params.cape_jkg,
+        "precipitation_mm":      10.0,
+        "humidity":              85.0,
+        "coastal_proximity_km":  coast_km,
+        "season_factor":         s_factor,
+        "lat_abs":               abs(params.demo_lat),
+        "gdacs_active":          False,
+        "gdacs_name":            "",
+        "gdacs_distance_km":     9999.0,
+        "gdacs_alert_level":     "",
+    }
+
+    prob     = compute_probability(features)
+    pct      = round(prob * 100)
+    risk     = _risk_label(prob)
+    category = _imd_category(params.wind_gusts_kmh)
+
+    # Collect push targets
+    push_msgs   = []
+    skipped_far = 0
+    try:
+        from services.supabase_service import _haversine
+        db = _get_service_client()
+        if db:
+            users_res = db.table("users").select("full_name,phone,push_token,latitude,longitude").execute()
+            for u in (users_res.data or []):
+                if not u.get("push_token"):
+                    continue
+                if params.target_phone:
+                    if u.get("phone") != params.target_phone:
+                        continue
+                else:
+                    if u.get("latitude") and u.get("longitude"):
+                        dist_km = _haversine(
+                            params.demo_lat, params.demo_lon,
+                            float(u["latitude"]), float(u["longitude"]),
+                        )
+                        if dist_km > params.radius_km:
+                            skipped_far += 1
+                            continue
+                    else:
+                        skipped_far += 1
+                        continue
+                push_msgs.append({
+                    "to":        u["push_token"],
+                    "title":     "🌀 CYCLONE ALERT",
+                    "body":      f"⚠️ DEMO — {risk} cyclone risk ({pct}%) · {category} · "
+                                 f"Gusts {params.wind_gusts_kmh:.0f} km/h. Stay indoors, follow IMD bulletins.",
+                    "sound":     "default",
+                    "priority":  "high",
+                    "badge":     1,
+                    "channelId": "sos",
+                    "data": {
+                        "type":        "cyclone_alert",
+                        "probability": round(prob, 3),
+                        "risk_level":  risk,
+                        "category":    category,
+                        "user_lat":    params.demo_lat,
+                        "user_lon":    params.demo_lon,
+                    },
+                })
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    sent = 0
+    if push_msgs:
+        try:
+            resp = _req.post(
+                "https://exp.host/--/api/v2/push/send",
+                json=push_msgs,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=15,
+            )
+            data = resp.json().get("data", [])
+            sent = sum(1 for d in data if isinstance(d, dict) and d.get("status") == "ok") \
+                   if isinstance(data, list) else len(push_msgs)
+        except Exception as e:
+            return JSONResponse({"success": False, "error": f"Push failed: {e}"}, status_code=500)
+
+    return {
+        "success":       True,
+        "probability":   round(prob, 3),
+        "pct":           pct,
+        "risk_level":    risk,
+        "category":      category,
+        "sent_to":       sent,
+        "total_targets": len(push_msgs),
+        "skipped_far":   skipped_far,
+        "ml_model_used": _CYCLONE_MODEL is not None,
         "features":      features,
         "note":          "Demo complete. Scheduler continues with real data — no state changed.",
     }
@@ -621,6 +760,11 @@ tbody tr:hover td{background:#fafbfd;}
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
       Analytics
     </a>
+    <div class="nlabel">Hazards</div>
+    <a class="nitem" onclick="gotoTab('cyclone',this)">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/><path d="M12 8c1.1 0 2 .4 2.8 1"/><path d="M16 12c0 1.1-.4 2.1-1 2.8"/></svg>
+      Cyclone
+    </a>
   </nav>
 
   <div class="sfooter">
@@ -628,6 +772,10 @@ tbody tr:hover td{background:#fafbfd;}
     <button class="demo-btn" onclick="openDemo()">
       <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
       Demo Flood Alert
+    </button>
+    <button class="demo-btn" style="background:linear-gradient(135deg,#7c3aed,#4f46e5);box-shadow:0 4px 14px rgba(124,58,237,.3)" onclick="openCycloneDemo()">
+      <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/></svg>
+      Demo Cyclone Alert
     </button>
     <button class="qbtn" onclick="window.open('/api/sos/dashboard','_blank')">
       <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>
@@ -736,6 +884,73 @@ tbody tr:hover td{background:#fafbfd;}
       <div class="panel" style="margin-bottom:0"><div class="ph"><span class="pt">7-Day SOS Trend</span></div><div class="cboxlg"><canvas id="analyticsChart"></canvas></div></div>
     </div>
 
+    <!-- ══ CYCLONE ══ -->
+    <div class="tsec" id="tab-cyclone">
+      <div class="sgrid" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px">
+        <div class="scard"><div class="sico" style="background:var(--purple-light)">🌀</div><div class="slbl">Cyclone Alerts Sent</div><div class="sval" id="cy-alerts">—</div><div class="smeta" style="color:var(--muted)">All time</div></div>
+        <div class="scard"><div class="sico" style="background:var(--primary-light)">🤖</div><div class="slbl">ML Model</div><div class="sval" id="cy-ml" style="font-size:18px;margin-top:4px">—</div><div class="smeta" id="cy-ml-m" style="color:var(--muted)">ERA5 trained</div></div>
+        <div class="scard"><div class="sico" style="background:var(--orange-light)">📡</div><div class="slbl">Data Sources</div><div class="sval" style="font-size:15px;font-weight:700;margin-top:4px;line-height:1.3">Open-Meteo<br>+ GDACS</div></div>
+        <div class="scard"><div class="sico" style="background:var(--green-light)">🗓️</div><div class="slbl">Training Events</div><div class="sval">38</div><div class="smeta" style="color:var(--muted)">2007–2024 landfalls</div></div>
+      </div>
+
+      <!-- IMD scale reference panel -->
+      <div class="g2e" style="margin-bottom:16px">
+        <div class="panel">
+          <div class="ph"><span class="pt">🌀 IMD Cyclone Scale</span><span class="ps">India Meteorological Department</span></div>
+          <table style="font-size:12px">
+            <thead><tr><th>Category</th><th>Wind Speed (km/h)</th><th>Risk</th></tr></thead>
+            <tbody>
+              <tr><td class="tdn">Depression</td><td>31 – 51</td><td><span class="badge" style="background:#f0fdf4;color:#166534;border:1px solid #86efac">Very Low</span></td></tr>
+              <tr><td class="tdn">Deep Depression</td><td>52 – 62</td><td><span class="badge" style="background:#f0fdf4;color:#166534;border:1px solid #86efac">Low</span></td></tr>
+              <tr><td class="tdn">Cyclonic Storm</td><td>63 – 88</td><td><span class="badge" style="background:#fffbeb;color:#92400e;border:1px solid #fcd34d">Moderate</span></td></tr>
+              <tr><td class="tdn">Severe Cyclonic Storm</td><td>89 – 117</td><td><span class="badge" style="background:#fff1f2;color:#991b1b;border:1px solid #fca5a5">High</span></td></tr>
+              <tr><td class="tdn">Very Severe Cyclonic Storm</td><td>118 – 167</td><td><span class="badge" style="background:#fff1f2;color:#991b1b;border:1px solid #fca5a5">High</span></td></tr>
+              <tr><td class="tdn">Extremely Severe</td><td>168 – 221</td><td><span class="badge" style="background:#fdf4ff;color:#4a044e;border:1px solid #e879f9">Extreme</span></td></tr>
+              <tr><td class="tdn">Super Cyclone</td><td>≥ 222</td><td><span class="badge" style="background:#fdf4ff;color:#4a044e;border:1px solid #e879f9">Extreme</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <div class="ph"><span class="pt">📅 Cyclone Season Calendar</span><span class="ps">IMD seasonal risk multipliers</span></div>
+          <div id="season-chart-wrap" style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-top:4px">
+            <!-- Rendered by JS -->
+          </div>
+          <div style="margin-top:14px;font-size:11px;color:var(--muted);line-height:1.6">
+            <strong>Bay of Bengal:</strong> Peak Apr–Jun &amp; Oct–Dec<br>
+            <strong>Arabian Sea:</strong> Peak May–Jun &amp; Oct–Nov
+          </div>
+        </div>
+      </div>
+
+      <!-- Recent cyclone alerts -->
+      <div class="panel" style="margin-bottom:16px">
+        <div class="ph"><span class="pt">Recent Cyclone Alerts</span><span class="ps" id="cy-alerts-lbl">from database</span></div>
+        <div id="cy-alerts-empty" class="empty"><div class="eico">🌀</div>No cyclone alerts sent yet</div>
+      </div>
+
+      <!-- Model features info -->
+      <div class="panel" style="margin-bottom:0">
+        <div class="ph"><span class="pt">🤖 ML Model Features</span><span class="ps">VotingClassifier: XGBoost + GradientBoosting + RandomForest</span></div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:4px">
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Primary Signals</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">💨 Wind Gusts (km/h)<br>📉 Surface Pressure (hPa)<br>⬇️ Pressure Drop / 6h</div>
+          </div>
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Atmospheric</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">⚡ CAPE (J/kg)<br>🌧️ Precipitation (mm)<br>💧 Relative Humidity (%)</div>
+          </div>
+          <div style="background:#f8fafc;border-radius:10px;padding:12px">
+            <div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px">Geospatial</div>
+            <div style="font-size:12px;color:var(--text2);line-height:2">🌊 Coastal Distance (km)<br>📅 Season Factor<br>🌐 Latitude</div>
+          </div>
+        </div>
+        <div style="margin-top:12px;padding:10px 14px;background:var(--purple-light);border-radius:10px;border:1px solid var(--purple-mid);font-size:12px;color:#4c1d95">
+          <strong>Training data:</strong> 38 documented Indian Ocean cyclone landfalls (Bay of Bengal + Arabian Sea, 2007–2024) + 62 control clear-weather days · ERA5 historical reanalysis via Open-Meteo
+        </div>
+      </div>
+    </div>
+
   </div><!-- /body -->
 </div><!-- /main -->
 
@@ -834,6 +1049,72 @@ tbody tr:hover td{background:#fafbfd;}
   </div>
 </div>
 
+<!-- ══════════════ CYCLONE DEMO MODAL ══════════════ -->
+<div class="modal-overlay" id="cycloneDemoOverlay" onclick="if(event.target===this)closeCycloneDemo()">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">🌀 Demo Cyclone Alert</div>
+        <div class="modal-sub">Enter cyclone parameters → runs ML model → sends real push notification once → scheduler resumes real data</div>
+      </div>
+      <button class="mclose" onclick="closeCycloneDemo()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="prob-bar-wrap" id="cy-probWrap">
+        <div class="prob-label">CYCLONE PROBABILITY</div>
+        <div class="prob-track"><div class="prob-fill" id="cy-probFill" style="width:0%;background:linear-gradient(90deg,#7c3aed,#dc2626)"></div></div>
+        <div class="prob-val" id="cy-probVal">—</div>
+      </div>
+      <div class="mparam-grid">
+        <div class="mfield">
+          <label>Wind Gusts (km/h)</label>
+          <input type="number" id="cy-gusts" value="95" step="1">
+          <div class="hint">63+ = Cyclonic Storm, 89+ = Severe</div>
+        </div>
+        <div class="mfield">
+          <label>Surface Pressure (hPa)</label>
+          <input type="number" id="cy-pres" value="975" step="0.5">
+          <div class="hint">&lt;980 = severe cyclone eye</div>
+        </div>
+        <div class="mfield">
+          <label>Pressure Drop / 6h (hPa)</label>
+          <input type="number" id="cy-drop" value="6" step="0.5">
+          <div class="hint">≥4 = rapid deepening</div>
+        </div>
+        <div class="mfield">
+          <label>CAPE (J/kg)</label>
+          <input type="number" id="cy-cape" value="1500" step="100">
+          <div class="hint">1000+ = high convective instability</div>
+        </div>
+        <div class="mfield">
+          <label>📍 Demo Latitude</label>
+          <input type="number" id="cy-lat" value="13.0827" step="0.0001">
+          <div class="hint">Only users within radius_km notified</div>
+        </div>
+        <div class="mfield">
+          <label>📍 Demo Longitude</label>
+          <input type="number" id="cy-lon" value="80.2707" step="0.0001">
+        </div>
+        <div class="mfield">
+          <label>📡 Radius (km)</label>
+          <input type="number" id="cy-radius" value="200" step="10" min="1" max="1000">
+          <div class="hint">Cyclone radius is much larger than flood</div>
+        </div>
+        <div class="mfield">
+          <label>🎯 Target Phone (optional)</label>
+          <input type="text" id="cy-phone" placeholder="Leave empty = use radius above">
+          <div class="hint">+91XXXXXXXXXX — overrides radius</div>
+        </div>
+      </div>
+      <button class="msend-btn" id="cy-sendBtn" style="background:linear-gradient(135deg,#7c3aed,#4f46e5);box-shadow:0 4px 16px rgba(124,58,237,.35)" onclick="sendCycloneDemo()">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/></svg>
+        Send Demo Cyclone Alert Now
+      </button>
+      <div class="mresult" id="cy-mresult"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
 let D = null, mapMini = null, mapFull = null;
@@ -846,7 +1127,7 @@ function tick(){ document.getElementById('clock').textContent = new Date().toLoc
 tick(); setInterval(tick,1000);
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TITLES={overview:'Overview',sos:'SOS Requests',map:'Live Map',users:'Users',analytics:'Analytics'};
+const TITLES={overview:'Overview',sos:'SOS Requests',map:'Live Map',users:'Users',analytics:'Analytics',cyclone:'Cyclone Intelligence'};
 function gotoTab(id,el){
   document.querySelectorAll('.tsec').forEach(s=>s.classList.remove('active'));
   document.querySelectorAll('.nitem').forEach(n=>n.classList.remove('active'));
@@ -882,6 +1163,7 @@ async function loadData(){
 function renderAll(){
   renderStats(); renderMiniMap(); renderDonut(); renderTrend();
   renderAreas(); renderRecentTbl(); renderAllTbl(); renderUsers(); renderAnalytics();
+  renderCyclone();
   const b=document.getElementById('nbadge');
   b.textContent=D.active_sos||0;
   b.className='nbadge'+(D.active_sos>0?'':' z');
@@ -1134,6 +1416,91 @@ function style_spin(){
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function $(id,v){const e=document.getElementById(id);if(e)e.textContent=v??'—';}
 function gv(id){return document.getElementById(id)?.value??'';}
+
+// ── Cyclone tab render ────────────────────────────────────────────────────────
+function renderCyclone(){
+  if(!D) return;
+  $('cy-alerts', D.cyclone_alerts ?? 0);
+  const mlEl = document.getElementById('cy-ml');
+  const mlMeta = document.getElementById('cy-ml-m');
+  if(mlEl){
+    if(D.cyclone_ml_active){
+      mlEl.textContent = '✅ Active';
+      mlEl.style.color = 'var(--green)';
+      if(mlMeta) mlMeta.textContent = 'ERA5-trained ensemble';
+    } else {
+      mlEl.textContent = '⚠ Physics';
+      mlEl.style.color = 'var(--orange)';
+      if(mlMeta) mlMeta.textContent = 'Run train_cyclone.py to activate ML';
+    }
+  }
+
+  // Season calendar
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const factors = [0.55,0.55,0.65,0.90,1.30,0.95,0.45,0.45,0.60,1.20,1.30,0.90];
+  const wrap = document.getElementById('season-chart-wrap');
+  if(wrap){
+    wrap.innerHTML = months.map((m,i)=>{
+      const f = factors[i];
+      const pct = Math.round(f * 100);
+      const col = f >= 1.2 ? '#dc2626' : f >= 0.9 ? '#ea580c' : f >= 0.6 ? '#ca8a04' : '#16a34a';
+      const bg  = f >= 1.2 ? '#fef2f2' : f >= 0.9 ? '#fff7ed' : f >= 0.6 ? '#fefce8' : '#f0fdf4';
+      return `<div style="background:${bg};border-radius:8px;padding:8px 4px;text-align:center">
+        <div style="font-size:10px;font-weight:700;color:${col}">${m}</div>
+        <div style="font-size:11px;font-weight:800;color:${col};margin-top:3px">${pct}%</div>
+      </div>`;
+    }).join('');
+  }
+}
+
+// ── Cyclone demo modal ────────────────────────────────────────────────────────
+function openCycloneDemo(){
+  document.getElementById('cycloneDemoOverlay').classList.add('open');
+  document.getElementById('cy-mresult').style.display='none';
+}
+function closeCycloneDemo(){
+  document.getElementById('cycloneDemoOverlay').classList.remove('open');
+}
+async function sendCycloneDemo(){
+  const btn = document.getElementById('cy-sendBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>Sending…';
+  const res = document.getElementById('cy-mresult');
+  res.style.display='none';
+  try{
+    const r = await fetch('/admin/demo-cyclone?admin_key='+encodeURIComponent(getKey()),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        wind_gusts_kmh:       parseFloat(gv('cy-gusts')),
+        surface_pressure_hpa: parseFloat(gv('cy-pres')),
+        pressure_drop_6h:     parseFloat(gv('cy-drop')),
+        cape_jkg:             parseFloat(gv('cy-cape')),
+        demo_lat:             parseFloat(gv('cy-lat')),
+        demo_lon:             parseFloat(gv('cy-lon')),
+        radius_km:            parseFloat(gv('cy-radius')),
+        target_phone:         gv('cy-phone').trim(),
+      })
+    });
+    const d = await r.json();
+    if(d.success){
+      const ml = d.ml_model_used ? '🤖 ML model' : '⚡ Physics model';
+      res.className='mresult ok'; res.style.display='block';
+      res.innerHTML=`✅ Demo sent! &nbsp;·&nbsp; Probability: <strong>${d.pct}%</strong> (${d.risk_level}) &nbsp;·&nbsp; Category: <strong>${d.category}</strong><br>
+        Push delivered to <strong>${d.sent_to}</strong> of ${d.total_targets} targets (${d.skipped_far} outside radius)<br>
+        <span style="font-size:11px;opacity:.8">${ml} · ${d.note}</span>`;
+    } else {
+      res.className='mresult err'; res.style.display='block';
+      res.textContent='❌ '+d.error;
+    }
+  }catch(e){
+    res.className='mresult err'; res.style.display='block';
+    res.textContent='Network error: '+e.message;
+  }finally{
+    btn.disabled=false;
+    btn.innerHTML='<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8c-2.2 0-4 1.8-4 4s1.8 4 4 4"/></svg>Send Demo Cyclone Alert Now';
+  }
+}
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 loadData();

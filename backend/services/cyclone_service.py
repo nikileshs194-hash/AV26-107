@@ -1,13 +1,14 @@
 """
-Cyclone prediction service — real-world data, no API key required.
+Cyclone prediction service — real-world data, ML model + physics fallback.
 
 Data sources:
   Open-Meteo Forecast API  — wind, gusts, pressure, CAPE (live + 6-h history)
   GDACS RSS Feed           — active tropical cyclones (TC) worldwide
   Indian coastline points  — to compute coastal proximity multiplier
 
-Scoring model: IMD (India Meteorological Department) threshold-based physics model.
-No ML model needed — the atmospheric physics are deterministic:
+Primary model: VotingClassifier ML model trained on 35+ documented Indian
+  Ocean cyclone landfalls (2007-2024) using ERA5 historical features.
+Fallback: IMD (India Meteorological Department) threshold-based physics model.
   component      weight   signal
   wind gusts     0.40     IMD cyclone scale (31 → 222+ km/h)
   pressure       0.30     low pressure eye (<980 hPa = severe)
@@ -18,9 +19,36 @@ No ML model needed — the atmospheric physics are deterministic:
 """
 
 import math
+import os
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+
+# ── ML model feature list (must match train_cyclone.py CYCLONE_FEATURES) ──────
+CYCLONE_FEATURES = [
+    "wind_gusts_kmh",
+    "surface_pressure_hpa",
+    "pressure_drop_6h",
+    "cape_jkg",
+    "precipitation_mm",
+    "humidity",
+    "coastal_proximity_km",
+    "season_factor",
+    "lat_abs",
+]
+
+# ── Load ML model at import time ──────────────────────────────────────────────
+_CYCLONE_MODEL = None
+try:
+    import joblib
+    _MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "cyclone_model.pkl")
+    if os.path.exists(_MODEL_PATH):
+        _CYCLONE_MODEL = joblib.load(_MODEL_PATH)
+        print(f"[CycloneService] ML model loaded from {_MODEL_PATH}")
+    else:
+        print("[CycloneService] cyclone_model.pkl not found — using physics model only")
+except Exception as _e:
+    print(f"[CycloneService] ML model load failed: {_e} — using physics fallback")
 
 _OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 _GDACS_RSS  = "https://www.gdacs.org/xml/rss.xml"
@@ -170,6 +198,7 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
                 "surface_pressure",
                 "cape",
                 "precipitation",
+                "relative_humidity_2m",
                 "weather_code",
             ],
             "hourly": [
@@ -190,11 +219,12 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
     cur    = d.get("current", {})
     hourly = d.get("hourly", {})
 
-    wind_speed  = float(cur.get("wind_speed_10m",  0) or 0)
-    wind_gusts  = float(cur.get("wind_gusts_10m",  0) or 0)
-    pressure    = float(cur.get("surface_pressure", 1013) or 1013)
-    cape        = float(cur.get("cape",             0) or 0)
-    precip      = float(cur.get("precipitation",    0) or 0)
+    wind_speed  = float(cur.get("wind_speed_10m",      0)    or 0)
+    wind_gusts  = float(cur.get("wind_gusts_10m",      0)    or 0)
+    pressure    = float(cur.get("surface_pressure",    1013) or 1013)
+    cape        = float(cur.get("cape",                0)    or 0)
+    precip      = float(cur.get("precipitation",       0)    or 0)
+    humidity    = float(cur.get("relative_humidity_2m", 70)  or 70)
 
     # Pressure trend: compare current pressure vs 6 hours ago
     h_pressure  = hourly.get("surface_pressure", [])
@@ -216,8 +246,10 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
         "pressure_drop_6h":      pressure_drop_6h,
         "cape_jkg":              round(cape,         1),
         "precipitation_mm":      round(precip,       2),
+        "humidity":              round(humidity,     1),
         "coastal_proximity_km":  coast_km,
         "season_factor":         s_factor,
+        "lat_abs":               round(abs(lat),     2),
         "gdacs_active":          gdacs["active"],
         "gdacs_name":            gdacs["name"],
         "gdacs_distance_km":     gdacs["distance_km"],
@@ -229,32 +261,52 @@ def fetch_cyclone_features(lat: float, lon: float) -> dict:
 
 def compute_probability(f: dict) -> float:
     """
-    Physics-based scoring aligned with IMD thresholds.
-    Weights: wind_gusts 0.40 · pressure 0.30 · pressure_drop 0.20 · CAPE 0.10
+    Hybrid probability: ML model (if available) blended with IMD physics score.
+    ML gets 70% weight when available; physics-only otherwise.
+    GDACS floor applied: if active TC within 1500 km → prob ≥ 0.60.
     """
-    # Wind gust component (IMD Super Cyclone = 222 km/h as max reference)
-    wind_score = min(f["wind_gusts_kmh"] / 222.0, 1.0)
+    # ── ML model probability ──────────────────────────────────────────────────
+    ml_prob = None
+    if _CYCLONE_MODEL is not None:
+        try:
+            import pandas as pd
+            row = {
+                "wind_gusts_kmh":        f["wind_gusts_kmh"],
+                "surface_pressure_hpa":  f["surface_pressure_hpa"],
+                "pressure_drop_6h":      f["pressure_drop_6h"],
+                "cape_jkg":              f["cape_jkg"],
+                "precipitation_mm":      f.get("precipitation_mm", f.get("precipitation_mm", 0.0)),
+                "humidity":              f.get("humidity", 70.0),
+                "coastal_proximity_km":  f["coastal_proximity_km"],
+                "season_factor":         f["season_factor"],
+                "lat_abs":               abs(f.get("lat_abs", 0.0)),
+            }
+            df = pd.DataFrame([row])
+            ml_prob = float(_CYCLONE_MODEL.predict_proba(df)[0][1])
+        except Exception as _e:
+            print(f"[CycloneService] ML inference failed: {_e}")
 
-    # Pressure component (normal = 1013 hPa; eye of super cyclone < 940 hPa)
+    # ── Physics-based scoring (IMD thresholds) ────────────────────────────────
+    wind_score     = min(f["wind_gusts_kmh"] / 222.0, 1.0)
     pressure_score = max(0.0, min((1013.0 - f["surface_pressure_hpa"]) / 73.0, 1.0))
+    drop           = max(f["pressure_drop_6h"], 0.0)
+    drop_score     = min(drop / 10.0, 1.0)
+    cape_score     = min(f["cape_jkg"] / 3000.0, 1.0)
 
-    # Pressure drop rate (10 hPa in 6 h = explosive deepening = max score)
-    drop = max(f["pressure_drop_6h"], 0.0)     # only count drops, not rises
-    drop_score = min(drop / 10.0, 1.0)
-
-    # CAPE component (3000 J/kg = extreme convection = max score)
-    cape_score = min(f["cape_jkg"] / 3000.0, 1.0)
-
-    base = (
+    physics_prob = (
         wind_score     * 0.40 +
         pressure_score * 0.30 +
         drop_score     * 0.20 +
         cape_score     * 0.10
     )
+    physics_prob *= f["season_factor"]
+    physics_prob *= _coast_factor(f["coastal_proximity_km"])
 
-    # Season and coastal multipliers
-    base *= f["season_factor"]
-    base *= _coast_factor(f["coastal_proximity_km"])
+    # ── Blend ─────────────────────────────────────────────────────────────────
+    if ml_prob is not None:
+        base = ml_prob * 0.70 + physics_prob * 0.30
+    else:
+        base = physics_prob
 
     # GDACS floor: confirmed active cyclone nearby → at least High
     if f["gdacs_active"]:
@@ -307,6 +359,10 @@ def predict_cyclone(lat: float, lon: float) -> dict:
     risk     = _risk_label(prob)
     category = _imd_category(features["wind_gusts_kmh"])
 
+    sources = ["Open-Meteo", "GDACS"]
+    if _CYCLONE_MODEL is not None:
+        sources.insert(0, "ML Model (ERA5-trained)")
+
     return {
         "cyclone_risk":       risk,
         "probability":        prob,
@@ -314,6 +370,7 @@ def predict_cyclone(lat: float, lon: float) -> dict:
         "cyclone_likely":     prob >= 0.60,
         "features":           features,
         "advice":             cyclone_advice(prob, features),
-        "data_sources":       ["Open-Meteo", "GDACS"],
+        "data_sources":       sources,
         "forecast_window":    "Current conditions + 6-hour trend",
+        "ml_model_active":    _CYCLONE_MODEL is not None,
     }

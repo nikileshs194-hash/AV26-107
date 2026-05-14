@@ -221,8 +221,10 @@ export interface CycloneFeatures {
   pressure_drop_6h: number;
   cape_jkg: number;
   precipitation_mm: number;
+  humidity: number;
   coastal_proximity_km: number;
   season_factor: number;
+  lat_abs?: number;
   gdacs_active: boolean;
   gdacs_name: string;
   gdacs_distance_km: number;
@@ -238,6 +240,7 @@ export interface CyclonePrediction {
   advice: string[];
   data_sources: string[];
   forecast_window: string;
+  ml_model_active?: boolean;
 }
 
 export const fetchCyclonePrediction = async (lat: number, lon: number): Promise<CyclonePrediction> => {
