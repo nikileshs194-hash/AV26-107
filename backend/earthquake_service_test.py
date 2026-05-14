@@ -1,0 +1,318 @@
+"""
+Earthquake Service — Standalone Test / Demo
+============================================
+Tests the trained earthquake_model.pkl using LIVE USGS data.
+
+Usage:
+    python earthquake_service_test.py
+    python earthquake_service_test.py --lat 28.6 --lon 77.2    # Delhi
+    python earthquake_service_test.py --lat 26.0 --lon 91.5    # Assam
+
+Prerequisites:
+    1. Run  python train_earthquake.py  first (creates earthquake_model.pkl)
+    2. Internet connection (fetches last 30 days of USGS data for features)
+
+This file is STANDALONE — it is NOT imported by main.py.
+Review and rename to  services/earthquake_service.py  to integrate.
+"""
+
+import argparse
+import math
+import os
+import time
+import sys
+from datetime import datetime, timedelta, timezone
+
+import joblib
+import numpy as np
+import pandas as pd
+import requests
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "earthquake_model.pkl")
+
+EARTHQUAKE_FEATURES = [
+    "recent_quakes_7d",
+    "recent_quakes_30d",
+    "max_mag_7d",
+    "max_mag_30d",
+    "energy_index_30d",
+    "depth_avg_30d",
+    "dist_to_fault_km",
+    "seismic_zone",
+]
+
+# ── Fault points (copied from train_earthquake.py) ────────────────────────────
+_FAULT_POINTS = [
+    (27.5,72.5),(28.0,74.0),(28.5,76.0),(29.0,78.0),(29.5,80.0),
+    (29.0,82.0),(28.5,84.0),(27.5,86.0),(27.0,88.0),(26.5,89.5),
+    (26.0,91.0),(25.5,92.5),(25.0,94.0),(26.0,95.5),(27.0,97.0),
+    (13.5,93.8),(12.0,93.2),(10.0,92.5),(8.0,92.0),
+    (6.5,93.5),(5.0,94.5),(4.5,95.5),
+    (24.5,93.5),(22.5,93.5),(20.5,93.0),(18.5,94.0),(17.0,95.0),
+    (23.0,96.5),(21.0,96.0),(19.0,96.5),(17.5,96.5),
+    (23.8,68.5),(23.5,70.0),(23.5,71.5),(22.8,72.5),
+    (22.0,73.5),(22.5,75.5),(23.0,77.5),(23.5,79.5),(23.8,81.5),(24.0,83.5),
+    (17.4,73.8),(17.0,74.0),(16.8,74.2),
+    (28.7,77.2),(28.5,78.5),(29.0,79.5),
+    (20.5,83.5),(21.0,85.5),(21.5,87.0),
+]
+_FAULT_LATS = np.array([p[0] for p in _FAULT_POINTS])
+_FAULT_LONS = np.array([p[1] for p in _FAULT_POINTS])
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _haversine_vec(lat, lon, lats, lons):
+    R = 6371.0
+    dlat = np.radians(lats - lat)
+    dlon = np.radians(lons - lon)
+    a = (np.sin(dlat/2)**2
+         + np.cos(np.radians(lat)) * np.cos(np.radians(lats)) * np.sin(dlon/2)**2)
+    return 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
+def _dist_to_fault(lat, lon):
+    return round(float(_haversine_vec(lat, lon, _FAULT_LATS, _FAULT_LONS).min()), 1)
+
+
+def _seismic_zone(lat, lon):
+    ZONE_V = [
+        (22.0,29.5,89.5,97.5),(6.0,14.5,92.0,94.5),(33.5,36.5,73.5,77.5),
+        (22.5,24.5,68.0,71.5),(32.0,33.5,75.5,78.5),
+    ]
+    ZONE_IV = [
+        (26.5,28.5,87.5,90.5),(29.5,31.5,78.0,81.0),(32.0,35.5,74.0,77.5),
+        (28.0,29.5,76.5,78.5),(27.5,30.0,80.0,84.0),(26.5,27.5,83.0,88.0),
+        (22.0,24.0,71.5,74.0),(17.0,18.5,73.5,75.0),(30.5,32.5,75.0,78.0),
+    ]
+    for a,b,c,d in ZONE_V:
+        if a<=lat<=b and c<=lon<=d: return 5
+    for a,b,c,d in ZONE_IV:
+        if a<=lat<=b and c<=lon<=d: return 4
+    if 8.0<=lat<=28.0 and 70.0<=lon<=90.0: return 3
+    return 2
+
+
+def _zone_label(z):
+    return {5:"V – Very High",4:"IV – High",3:"III – Moderate",2:"II – Low"}.get(z,"Unknown")
+
+
+def _risk_label(prob):
+    if prob >= 0.70: return "High",     "[HIGH]"
+    if prob >= 0.45: return "Moderate", "[MOD] "
+    if prob >= 0.20: return "Low",      "[LOW] "
+    return "Very Low", "[VLW] "
+
+
+# ── Live USGS feature fetch ───────────────────────────────────────────────────
+
+def fetch_live_features(lat: float, lon: float) -> dict:
+    """
+    Fetch the last 30 days of USGS data for this location and compute
+    the 8 ML features the model needs.
+    """
+    now      = datetime.now(tz=timezone.utc)
+    start_30 = (now - timedelta(days=31)).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
+
+    # Bounding box: ±3 degrees (~330 km) — wider than 150 km to get context
+    bbox_pad = 3.0
+    url = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+    params = {
+        "format":       "geojson",
+        "starttime":    start_30,
+        "endtime":      end_date,
+        "minlatitude":  lat - bbox_pad,
+        "maxlatitude":  lat + bbox_pad,
+        "minlongitude": lon - bbox_pad,
+        "maxlongitude": lon + bbox_pad,
+        "minmagnitude": 2.0,
+        "orderby":      "time",
+        "limit":        2000,
+    }
+
+    print(f"  [USGS] Fetching live seismic data ({start_30} to {end_date}) ...")
+    for attempt in range(2):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            features_list = r.json().get("features", [])
+            break
+        except Exception as e:
+            if attempt == 0:
+                print(f"  [USGS] Retry after error: {e}")
+                time.sleep(1)
+            else:
+                print(f"  [USGS] Failed: {e}. Using fallback features.")
+                return _fallback_features(lat, lon)
+
+    if not features_list:
+        print("  [USGS] No recent events found near this location.")
+        return _fallback_features(lat, lon)
+
+    rows = []
+    for feat in features_list:
+        props  = feat.get("properties", {})
+        coords = feat.get("geometry", {}).get("coordinates", [None, None, None])
+        ts_ms  = props.get("time")
+        if ts_ms is None or coords[0] is None: continue
+        rows.append({
+            "time":  datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+            "lat":   float(coords[1]),
+            "lon":   float(coords[0]),
+            "depth": float(coords[2]) if coords[2] is not None else 10.0,
+            "mag":   float(props.get("mag") or 0.0),
+        })
+
+    if not rows:
+        return _fallback_features(lat, lon)
+
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+
+    # Compute distances and filter to 150 km radius
+    dists = _haversine_vec(lat, lon, df["lat"].values, df["lon"].values)
+    nearby = df[dists <= 150.0].copy()
+    nearby_7d = nearby[nearby["time"] >= now - timedelta(days=7)]
+
+    n_30d = len(nearby)
+    n_7d  = len(nearby_7d)
+
+    max_mag_30d = float(nearby["mag"].max())    if n_30d > 0 else 0.0
+    max_mag_7d  = float(nearby_7d["mag"].max()) if n_7d  > 0 else 0.0
+    energy_30d  = float(np.sum(10 ** (0.75 * nearby["mag"].values))) if n_30d > 0 else 0.0
+    depths      = nearby["depth"].dropna()
+    depth_avg   = float(depths.mean()) if len(depths) > 0 else 35.0
+
+    print(f"  [USGS] Found {len(df)} events in bbox, {n_30d} within 150 km")
+
+    return {
+        "recent_quakes_7d":  n_7d,
+        "recent_quakes_30d": n_30d,
+        "max_mag_7d":        round(max_mag_7d,  2),
+        "max_mag_30d":       round(max_mag_30d, 2),
+        "energy_index_30d":  round(energy_30d,  2),
+        "depth_avg_30d":     round(depth_avg,   1),
+        "dist_to_fault_km":  _dist_to_fault(lat, lon),
+        "seismic_zone":      _seismic_zone(lat, lon),
+    }
+
+
+def _fallback_features(lat, lon):
+    return {
+        "recent_quakes_7d":  0,
+        "recent_quakes_30d": 0,
+        "max_mag_7d":        0.0,
+        "max_mag_30d":       0.0,
+        "energy_index_30d":  0.0,
+        "depth_avg_30d":     35.0,
+        "dist_to_fault_km":  _dist_to_fault(lat, lon),
+        "seismic_zone":      _seismic_zone(lat, lon),
+    }
+
+
+# ── Main prediction function ──────────────────────────────────────────────────
+
+def predict_earthquake(lat: float, lon: float, model) -> dict:
+    """Run full prediction pipeline for a location."""
+    features = fetch_live_features(lat, lon)
+    df = pd.DataFrame([features])
+    prob     = round(float(model.predict_proba(df)[0][1]), 3)
+    risk, icon = _risk_label(prob)
+    zone     = _seismic_zone(lat, lon)
+
+    advice = []
+    if features["recent_quakes_7d"] >= 5:
+        advice.append(f"Elevated seismic activity: {features['recent_quakes_7d']} earthquakes in past 7 days nearby.")
+    if features["max_mag_7d"] >= 4.0:
+        advice.append(f"Recent M{features['max_mag_7d']:.1f} earthquake detected. Aftershocks possible.")
+    if features["dist_to_fault_km"] < 30:
+        advice.append(f"Location is {features['dist_to_fault_km']:.0f} km from a major fault — high structural vulnerability.")
+    if features["depth_avg_30d"] < 20:
+        advice.append(f"Recent earthquakes are very shallow ({features['depth_avg_30d']:.0f} km) — higher surface impact.")
+    if zone >= 4:
+        advice.append(f"This area is in BIS Seismic Zone {_zone_label(zone)} — ensure buildings are earthquake-resistant.")
+    if prob >= 0.70:
+        advice.append("HIGH RISK: Prepare emergency kit. Know your building's evacuation route.")
+    elif prob >= 0.45:
+        advice.append("MODERATE RISK: Be aware of drop-cover-hold procedures.")
+    if not advice:
+        advice.append("No significant seismic activity detected. Standard preparedness is sufficient.")
+
+    return {
+        "risk_level":        risk,
+        "probability":       prob,
+        "probability_pct":   f"{prob*100:.1f}%",
+        "icon":              icon,
+        "forecast_window":   "Next 7 days",
+        "target_radius_km":  100,
+        "features":          features,
+        "seismic_zone":      _zone_label(zone),
+        "advice":            advice,
+    }
+
+
+# ── CLI demo ──────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Earthquake risk prediction demo")
+    parser.add_argument("--lat", type=float, default=None)
+    parser.add_argument("--lon", type=float, default=None)
+    args = parser.parse_args()
+
+    # Load model
+    if not os.path.exists(_MODEL_PATH):
+        print(f"ERROR: {_MODEL_PATH} not found.")
+        print("Run  python train_earthquake.py  first.")
+        sys.exit(1)
+
+    print("=" * 65)
+    print("  Earthquake Risk Prediction — JeevanSetu AI")
+    print("=" * 65)
+    model = joblib.load(_MODEL_PATH)
+    print(f"Model loaded: {_MODEL_PATH}\n")
+
+    # If lat/lon provided to single city
+    if args.lat and args.lon:
+        cities = [("Custom Location", args.lat, args.lon)]
+    else:
+        # Demo: 8 major Indian cities spanning all seismic zones
+        cities = [
+            ("Guwahati (Assam)",        26.18, 91.74),   # Zone V
+            ("Srinagar (J&K)",          34.08, 74.79),   # Zone V
+            ("Bhuj (Gujarat)",          23.25, 69.67),   # Zone V
+            ("Dehradun (Uttarakhand)",  30.32, 78.03),   # Zone IV
+            ("Delhi",                   28.61, 77.21),   # Zone IV
+            ("Mumbai",                  19.07, 72.88),   # Zone III
+            ("Bengaluru",               12.97, 77.59),   # Zone II
+            ("Port Blair (Andaman)",    11.67, 92.74),   # Zone V
+        ]
+
+    print(f"{'City':<28} {'Zone':<18} {'Prob':>6}  {'Risk':<10}  Quakes-7d / 30d\n"
+          + "-" * 80)
+
+    for city, lat, lon in cities:
+        print(f"\n{city}  (lat={lat}, lon={lon})")
+        result = predict_earthquake(lat, lon, model)
+        f = result["features"]
+        print(
+            f"  {city:<26} {result['seismic_zone']:<18} "
+            f"{result['probability_pct']:>6}  "
+            f"{result['icon']} {result['risk_level']:<8}  "
+            f"{f['recent_quakes_7d']}d / {f['recent_quakes_30d']}30d"
+        )
+        print(f"  Max mag 7d: M{f['max_mag_7d']:.1f}   "
+              f"Depth avg: {f['depth_avg_30d']:.0f} km   "
+              f"Fault dist: {f['dist_to_fault_km']:.0f} km")
+        for tip in result["advice"]:
+            print(f"  to {tip}")
+
+    print("\n" + "=" * 65)
+    print("NOTE: This model predicts seismic RISK (probability of M>=4.5")
+    print("within 100 km in the next 7 days). It is NOT a deterministic")
+    print("prediction of exactly when/where an earthquake will occur.")
+    print("Always follow official IMD / NDMA advisories.")
+    print("=" * 65)
