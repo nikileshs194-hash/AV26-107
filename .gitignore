@@ -1,0 +1,36 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environment — never commit secrets
+.env
+.env.*
+*.env
+
+# Node / JS
+node_modules/
+.next/
+.cache/
+
+# Expo / React Native
+mobile-app/.expo/
+
+# IDE & system
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Claude internal session files
+.claude/
+.claire/
+
+# Logs
+*.log
+logs/
