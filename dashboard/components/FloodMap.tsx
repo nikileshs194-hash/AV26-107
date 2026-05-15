@@ -66,9 +66,7 @@ interface EarthquakeData {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BACKEND =
-  typeof window !== "undefined" && window.location.hostname !== "localhost"
-    ? `http://${window.location.hostname}:8000`
-    : "http://localhost:8000";
+  process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
 const DEFAULT_LAT = 12.9716;
 const DEFAULT_LON = 77.5946;
