@@ -609,11 +609,114 @@ async def chat_cleanup_loop() -> None:
         await asyncio.sleep(3600)   # check every hour
 
 
+# ── LOOP 5 — Earthquake check (every 3 hours) ─────────────────────────────────
+
+_earthquake_cooldown: dict[str, datetime] = {}
+EARTHQUAKE_COOLDOWN_SECS = 6 * 60 * 60   # 6-hour gap between earthquake alerts
+EARTHQUAKE_CHECK_SECS    = 3 * 60 * 60   # check every 3 hours (USGS data changes slowly)
+
+
+def _run_earthquake_check_sync(users: list[dict]) -> list[dict]:
+    """
+    Run earthquake prediction for all users. Returns push payloads to send.
+    Called via asyncio.to_thread so it doesn't block the event loop.
+    """
+    try:
+        from services.earthquake_service import predict_earthquake
+    except Exception as e:
+        logger.warning(f"[EarthquakeCheck] import error: {e}")
+        return []
+
+    now      = datetime.now(timezone.utc)
+    messages = []
+
+    for u in users:
+        lat, lon = float(u["latitude"]), float(u["longitude"])
+        phone    = u.get("phone", "")
+
+        last = _earthquake_cooldown.get(phone)
+        if last and (now - last).total_seconds() < EARTHQUAKE_COOLDOWN_SECS:
+            continue
+
+        try:
+            result = predict_earthquake(lat, lon)
+            risk   = result.get("earthquake_risk", "Low")
+            prob   = result.get("probability", 0.0)
+        except Exception as e:
+            logger.warning(f"[EarthquakeCheck] predict error ({phone}): {e}")
+            continue
+
+        if risk not in ("High",):
+            continue
+
+        _earthquake_cooldown[phone] = now
+
+        pct  = round(prob * 100)
+        zone = result.get("seismic_zone", "Unknown")
+        now_str = now.strftime("%H:%M")
+
+        _save_alert_to_db(phone, {
+            "alert_id":    f"eq_{phone}_{int(now.timestamp())}",
+            "title":       "🪨 Seismic Alert — High Earthquake Risk",
+            "description": (
+                f"High earthquake risk ({pct}%) detected in {zone}. "
+                f"Probability of M≥4.5 within 100 km in next 7 days. "
+                f"DROP, COVER, and HOLD ON if shaking occurs."
+            ),
+            "severity":    "High",
+            "source":      "Earthquake AI Model",
+            "location":    f"{round(lat, 4)}, {round(lon, 4)}",
+            "icon":        "warning",
+            "icon_bg":     "#FFF8E1",
+            "icon_color":  "#F57F17",
+            "border_color": "#F57F17",
+            "when_text":   f"High · {now_str}",
+            "when_color":  "#F57F17",
+        })
+
+        messages.append({
+            "to":        u["push_token"],
+            "title":     "🪨 EARTHQUAKE ALERT",
+            "body":      f"High seismic risk ({pct}%) in {zone}. Stay away from structures if shaking occurs.",
+            "sound":     "default",
+            "priority":  "high",
+            "badge":     1,
+            "channelId": "sos",
+            "data": {
+                "type":        "earthquake_alert",
+                "probability": round(prob, 3),
+                "risk_level":  risk,
+                "seismic_zone": zone,
+                "user_lat":    lat,
+                "user_lon":    lon,
+            },
+        })
+        logger.info(f"[EarthquakeCheck] 🪨 High risk ({pct}%) for {phone} — alert queued")
+
+    return messages
+
+
+async def earthquake_check_loop() -> None:
+    """Runs every 3 hours. Fires earthquake alert when risk = High."""
+    logger.info("[EarthquakeCheck] Loop started — checking every 3 h")
+    while True:
+        try:
+            users = await asyncio.to_thread(_get_all_users_with_token)
+            if users:
+                messages = await asyncio.to_thread(_run_earthquake_check_sync, users)
+                if messages:
+                    await asyncio.to_thread(_send_pushes, messages)
+        except Exception as e:
+            logger.error(f"[EarthquakeCheck] Loop error: {e}")
+
+        await asyncio.sleep(EARTHQUAKE_CHECK_SECS)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def run_scheduler() -> None:
     """
-    Start all three loops concurrently.
+    Start all background loops concurrently.
     Called from main.py lifespan — runs for the entire server lifetime.
     """
     logging.basicConfig(level=logging.INFO)
@@ -621,6 +724,7 @@ async def run_scheduler() -> None:
     await asyncio.gather(
         flood_check_loop(),
         cyclone_check_loop(),
+        earthquake_check_loop(),
         weather_tip_loop(),
         chat_cleanup_loop(),
     )
