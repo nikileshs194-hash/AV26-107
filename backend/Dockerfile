@@ -7,4 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# bust cache: 2026-05-15
+
 CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
