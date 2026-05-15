@@ -34,3 +34,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Generated / cached data files
+*.csv
